@@ -227,6 +227,7 @@ jobs:
           cat > app/src/main/java/com/grey/pulse/Audio.kt << 'KOTLIN_EOF'
           package com.grey.pulse
 
+          import android.content.SharedPreferences
           import androidx.annotation.OptIn
           import androidx.media3.common.C
           import androidx.media3.common.audio.AudioProcessor
@@ -234,7 +235,9 @@ jobs:
           import androidx.media3.common.util.UnstableApi
           import java.nio.ByteBuffer
           import kotlin.math.PI
+          import kotlin.math.abs
           import kotlin.math.cos
+          import kotlin.math.exp
           import kotlin.math.log10
           import kotlin.math.max
           import kotlin.math.pow
@@ -243,18 +246,92 @@ jobs:
 
           data class EqBand(val freq: Int, val gain: Int)
 
+          /** All visualizer settings (menu > Visualizer). Defaults are what you asked for. */
+          object Cfg {
+              @Volatile var bassLo = 16          // Hz, top flare
+              @Volatile var bassHi = 60          // Hz, bottom flare
+              @Volatile var bassSens = 1f
+              @Volatile var midLo = 1000         // Hz, rocking motion range
+              @Volatile var midHi = 4000
+              @Volatile var midSens = 1f
+              @Volatile var midMove = 1f         // how far the center moves
+              @Volatile var beatSens = 1f
+              @Volatile var popStrength = 1f     // how big the center gets on a beat
+              @Volatile var scatter = 1f         // how far particles are kicked on a beat
+              @Volatile var syncMs = 120         // visuals delay to match the speaker
+              @Volatile var pSize = 1f
+              @Volatile var pCount = 160
+              @Volatile var pRumble = 1f
+              @Volatile var rangeVersion = 0     // bump when a Hz range changes (processor retunes)
+
+              fun reset() {
+                  bassLo = 16; bassHi = 60; bassSens = 1f
+                  midLo = 1000; midHi = 4000; midSens = 1f; midMove = 1f
+                  beatSens = 1f; popStrength = 1f; scatter = 1f; syncMs = 120
+                  pSize = 1f; pCount = 160; pRumble = 1f
+              }
+
+              fun load(p: SharedPreferences) {
+                  bassLo = p.getInt("c_bassLo", 16)
+                  bassHi = p.getInt("c_bassHi", 60)
+                  bassSens = p.getFloat("c_bassSens", 1f)
+                  midLo = p.getInt("c_midLo", 1000)
+                  midHi = p.getInt("c_midHi", 4000)
+                  midSens = p.getFloat("c_midSens", 1f)
+                  midMove = p.getFloat("c_midMove", 1f)
+                  beatSens = p.getFloat("c_beatSens", 1f)
+                  popStrength = p.getFloat("c_pop", 1f)
+                  scatter = p.getFloat("c_scatter", 1f)
+                  syncMs = p.getInt("c_sync", 120)
+                  pSize = p.getFloat("c_pSize", 1f)
+                  pCount = p.getInt("c_pCount", 160)
+                  pRumble = p.getFloat("c_pRumble", 1f)
+                  if (bassHi < bassLo + 5) bassHi = bassLo + 5
+                  if (midHi < midLo + 200) midHi = midLo + 200
+                  rangeVersion++
+              }
+
+              fun save(p: SharedPreferences) {
+                  p.edit()
+                      .putInt("c_bassLo", bassLo).putInt("c_bassHi", bassHi).putFloat("c_bassSens", bassSens)
+                      .putInt("c_midLo", midLo).putInt("c_midHi", midHi).putFloat("c_midSens", midSens)
+                      .putFloat("c_midMove", midMove).putFloat("c_beatSens", beatSens)
+                      .putFloat("c_pop", popStrength).putFloat("c_scatter", scatter).putInt("c_sync", syncMs)
+                      .putFloat("c_pSize", pSize).putInt("c_pCount", pCount).putFloat("c_pRumble", pRumble)
+                      .apply()
+              }
+          }
+
           /**
            * Shared in-process bridge between the audio thread (BusProcessor) and the UI.
-           * levels[] = 12 bass bands from FREQ_MIN to FREQ_MAX Hz, each 0..1.
+           *  levels[] : 12 bass bands from Cfg.bassLo to Cfg.bassHi Hz, each 0..1 (top flare -> bottom flare)
+           *  mid      : average level of the mid range (Cfg.midLo..midHi), drives the rocking motion
+           *  beat queue: detected beats (wall-clock nanoTime, strength, kind 0=beat 1=bar 2=8-bar phrase)
            */
           object AudioBus {
-              // The visualizer only listens to this range (as requested: 16 Hz - 60 Hz).
-              const val FREQ_MIN = 16
-              const val FREQ_MAX = 60
-              const val BANDS = 12 // 16,20,24,...,60 Hz (4 Hz steps)
+              const val BANDS = 12
+              const val QN = 16
 
               @JvmField val levels = FloatArray(BANDS)
+              @Volatile var mid = 0f
               @Volatile var lastUpdateNs = 0L
+
+              @Volatile var bpm = 0f
+              @Volatile var bpmNs = 0L
+
+              @JvmField val beatNs = LongArray(QN)
+              @JvmField val beatStr = FloatArray(QN)
+              @JvmField val beatKind = IntArray(QN)
+              @Volatile var beatHead = 0
+
+              fun pushBeat(ns: Long, str: Float, kind: Int) {
+                  val h = beatHead
+                  val i = h % QN
+                  beatNs[i] = ns
+                  beatStr[i] = str
+                  beatKind[i] = kind
+                  beatHead = h + 1
+              }
 
               @Volatile var eqOn = false
               @Volatile var eqBands: List<EqBand> = emptyList()
@@ -270,75 +347,154 @@ jobs:
           /**
            * Sits in ExoPlayer's audio chain (16-bit PCM only):
            *  1) user EQ: one peaking biquad per band (gain -50..0 dB)
-           *  2) bass analysis: low-pass + decimate, then Goertzel at 16..60 Hz -> AudioBus.levels
-           * Analysis is done AFTER the EQ, so the visualizer shows what you actually hear.
-           * No microphone / RECORD_AUDIO permission needed.
+           *  2) bass analysis (Goertzel, Cfg.bassLo..bassHi) -> AudioBus.levels
+           *  3) mid analysis (Goertzel, Cfg.midLo..midHi)    -> AudioBus.mid
+           *  4) beat detection on the low band + tempo / bar tracking -> AudioBus beat queue
+           * Analysis runs AFTER the EQ, so the visuals follow what you actually hear.
            */
           @OptIn(UnstableApi::class)
           class BusProcessor : BaseAudioProcessor() {
 
               companion object {
-                  private const val N = 256          // Goertzel window (decimated samples)
-                  private const val HOP = 32         // new analysis every 32 decimated samples
+                  private const val N = 256          // bass Goertzel window (decimated samples)
+                  private const val HOP = 32
                   private const val EQ_Q = 1.0
-                  private val FREQS = DoubleArray(AudioBus.BANDS) {
-                      AudioBus.FREQ_MIN + it * (AudioBus.FREQ_MAX - AudioBus.FREQ_MIN) / (AudioBus.BANDS - 1.0)
-                  }
+                  private const val N2 = 512         // mid Goertzel window (raw samples)
+                  private const val HOP2 = 256
+                  private const val MID_BANDS = 6
+                  private const val BLK = 16         // beat energy block (decimated samples)
+                  private const val BH = 48          // beat energy history (blocks, ~0.55 s)
+                  private const val BT = 12          // beat times kept for tempo
                   private val WIN = FloatArray(N) { (0.5 - 0.5 * cos(2.0 * PI * it / (N - 1))).toFloat() }
+                  private val WIN2 = FloatArray(N2) { (0.5 - 0.5 * cos(2.0 * PI * it / (N2 - 1))).toFloat() }
               }
 
               private var sr = 44100
               private var ch = 2
+              private var chunkNs = 0L
+              private var curFrame = 0
+              private var framesTotal = 0L
 
               // EQ state (audio thread only)
               private var eqVersionApplied = -1
               private var eqWasOn = false
               private var nBands = 0
-              private var coef = DoubleArray(0) // 5 per band: b0 b1 b2 a1 a2
-              private var st = DoubleArray(0)   // 4 per band per channel: x1 x2 y1 y2
+              private var coef = DoubleArray(0)
+              private var st = DoubleArray(0)
 
-              // analysis state
+              // retune
+              private var rangeApplied = -1
               private var dec = 32
-              private var decCount = 0
               private var lpA = 0.0
+              private val gk = DoubleArray(AudioBus.BANDS)
+              private val midK = DoubleArray(MID_BANDS)
+
+              // bass analysis
+              private var decCount = 0
               private var lp1 = 0.0
               private var lp2 = 0.0
               private val ring = FloatArray(N)
               private var ringPos = 0
               private var hopCount = 0
-              private val gk = DoubleArray(AudioBus.BANDS)
+
+              // mid analysis
+              private val ring2 = FloatArray(N2)
+              private var ring2Pos = 0
+              private var hop2Count = 0
+
+              // beat detection
+              private var blkAcc = 0.0
+              private var blkN = 0
+              private val eHist = DoubleArray(BH)
+              private var ehPos = 0
+              private var ehFill = 0
+              private var ehSum = 0.0
+              private var ePrev = 0.0
+              private var sinceBeat = 10.0
+              private var lastBeatT = -10.0
+              private val bt = DoubleArray(BT)
+              private var btN = 0
+              private var period = 0.0
+              private var beatIdx = 0
+              private var barIdx = 0
+              private var downPhase = 0
+              private val phaseAcc = FloatArray(4)
 
               override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
                   if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT ||
                       inputAudioFormat.channelCount < 1 || inputAudioFormat.channelCount > 8
                   ) {
-                      // not supported: stay inactive, audio still plays normally
-                      return AudioProcessor.AudioFormat.NOT_SET
+                      return AudioProcessor.AudioFormat.NOT_SET // inactive, audio still plays
                   }
                   sr = inputAudioFormat.sampleRate
                   ch = inputAudioFormat.channelCount
-                  dec = max(1, sr / 1400)
-                  val fsD = sr.toDouble() / dec
-                  for (i in 0 until AudioBus.BANDS) gk[i] = 2.0 * cos(2.0 * PI * FREQS[i] / fsD)
-                  lpA = 1.0 - Math.exp(-2.0 * PI * 200.0 / sr)
-                  lp1 = 0.0; lp2 = 0.0; decCount = 0; hopCount = 0; ringPos = 0
-                  java.util.Arrays.fill(ring, 0f)
+                  dec = 0
+                  retune()
+                  lp1 = 0.0; lp2 = 0.0
                   eqVersionApplied = -1
                   nBands = 0
                   st = DoubleArray(0)
+                  resetBeat()
                   return inputAudioFormat
+              }
+
+              private fun resetAnalysis() {
+                  decCount = 0; hopCount = 0; ringPos = 0
+                  java.util.Arrays.fill(ring, 0f)
+                  blkAcc = 0.0; blkN = 0
+                  java.util.Arrays.fill(eHist, 0.0)
+                  ehPos = 0; ehFill = 0; ehSum = 0.0; ePrev = 0.0
+              }
+
+              private fun resetBeat() {
+                  resetAnalysis()
+                  java.util.Arrays.fill(ring2, 0f)
+                  ring2Pos = 0; hop2Count = 0
+                  sinceBeat = 10.0; lastBeatT = -10.0
+                  btN = 0; period = 0.0
+                  beatIdx = 0; barIdx = 0; downPhase = 0
+                  java.util.Arrays.fill(phaseAcc, 0f)
+              }
+
+              /** Recompute the Goertzel frequency tables from the current settings. */
+              private fun retune() {
+                  val lo = Cfg.bassLo.toDouble().coerceAtLeast(5.0)
+                  val hi = Cfg.bassHi.toDouble().coerceAtLeast(lo + 5.0)
+                  val target = max(1400.0, hi * 6.0)
+                  val newDec = max(1, (sr / target).toInt())
+                  val fsD = sr.toDouble() / newDec
+                  for (i in 0 until AudioBus.BANDS) {
+                      val f = lo + i * (hi - lo) / (AudioBus.BANDS - 1.0)
+                      gk[i] = 2.0 * cos(2.0 * PI * f / fsD)
+                  }
+                  lpA = 1.0 - exp(-2.0 * PI * max(200.0, hi * 1.6) / sr)
+                  if (newDec != dec) {
+                      dec = newDec
+                      resetAnalysis()
+                  }
+                  val mlo = Cfg.midLo.toDouble().coerceAtLeast(100.0)
+                  val mhi = Cfg.midHi.toDouble().coerceAtLeast(mlo * 1.2).coerceAtMost(sr * 0.45)
+                  for (i in 0 until MID_BANDS) {
+                      val f = mlo * (mhi / mlo).coerceAtLeast(1.01).pow(i / (MID_BANDS - 1.0))
+                      midK[i] = 2.0 * cos(2.0 * PI * f / sr)
+                  }
+                  rangeApplied = Cfg.rangeVersion
               }
 
               override fun queueInput(inputBuffer: ByteBuffer) {
                   val n = inputBuffer.remaining()
                   if (n == 0) return
                   val out = replaceOutputBuffer(n)
+                  if (rangeApplied != Cfg.rangeVersion) retune()
                   syncEq()
+                  chunkNs = System.nanoTime()
                   val on = AudioBus.eqOn && nBands > 0
                   if (on && !eqWasOn) java.util.Arrays.fill(st, 0.0)
                   eqWasOn = on
                   val frames = n / (2 * ch)
                   for (f in 0 until frames) {
+                      curFrame = f
+                      framesTotal++
                       var mono = 0.0
                       for (c in 0 until ch) {
                           var x = inputBuffer.getShort().toDouble() / 32768.0
@@ -376,7 +532,7 @@ jobs:
                       val b = bands[i]
                       val ci = i * 5
                       if (b.gain >= 0 || b.freq >= sr * 0.45) {
-                          coef[ci] = 1.0 // identity
+                          coef[ci] = 1.0
                           continue
                       }
                       val a = 10.0.pow(b.gain / 40.0)
@@ -393,23 +549,47 @@ jobs:
               }
 
               private fun analyze(x: Double) {
+                  // ---- mid (raw samples)
+                  ring2[ring2Pos] = x.toFloat()
+                  ring2Pos = (ring2Pos + 1) % N2
+                  hop2Count++
+                  if (hop2Count >= HOP2) {
+                      hop2Count = 0
+                      computeMid()
+                  }
+
+                  // ---- bass (low-pass + decimate)
                   lp1 += lpA * (x - lp1)
                   lp2 += lpA * (lp1 - lp2)
                   decCount++
                   if (decCount < dec) return
                   decCount = 0
+
+                  // beat energy blocks
+                  blkAcc += lp2 * lp2
+                  blkN++
+                  if (blkN >= BLK) {
+                      val e = blkAcc / BLK
+                      blkAcc = 0.0
+                      blkN = 0
+                      onBlock(e)
+                  }
+
                   ring[ringPos] = lp2.toFloat()
                   ringPos = (ringPos + 1) % N
                   hopCount++
                   if (hopCount < HOP) return
                   hopCount = 0
+                  computeBass()
+              }
 
+              private fun computeBass() {
                   val lv = AudioBus.levels
                   for (i in 0 until AudioBus.BANDS) {
                       val k = gk[i]
                       var s1 = 0.0
                       var s2 = 0.0
-                      var p = ringPos // oldest sample first
+                      var p = ringPos
                       for (j in 0 until N) {
                           val s0 = ring[p].toDouble() * WIN[j].toDouble() + k * s1 - s2
                           s2 = s1
@@ -423,6 +603,103 @@ jobs:
                       lv[i] = ((db + 60.0) / 57.0).coerceIn(0.0, 1.0).toFloat()
                   }
                   AudioBus.lastUpdateNs = System.nanoTime()
+              }
+
+              private fun computeMid() {
+                  var sum = 0.0
+                  for (i in 0 until MID_BANDS) {
+                      val k = midK[i]
+                      var s1 = 0.0
+                      var s2 = 0.0
+                      var p = ring2Pos
+                      for (j in 0 until N2) {
+                          val s0 = ring2[p].toDouble() * WIN2[j].toDouble() + k * s1 - s2
+                          s2 = s1
+                          s1 = s0
+                          p++
+                          if (p == N2) p = 0
+                      }
+                      val power = s1 * s1 + s2 * s2 - k * s1 * s2
+                      val amp = sqrt(max(power, 0.0)) / (N2 / 4.0)
+                      val db = 20.0 * log10(amp + 1e-9)
+                      sum += ((db + 70.0) / 50.0).coerceIn(0.0, 1.0)
+                  }
+                  AudioBus.mid = (sum / MID_BANDS).toFloat()
+              }
+
+              // ------------------------------------------------------------ beats
+              private fun onBlock(e: Double) {
+                  val dtB = BLK.toDouble() * dec / sr
+                  sinceBeat += dtB
+                  val avg = if (ehFill > 0) ehSum / ehFill else 0.0
+                  ehSum -= eHist[ehPos]
+                  eHist[ehPos] = e
+                  ehSum += e
+                  ehPos = (ehPos + 1) % BH
+                  if (ehFill < BH) ehFill++
+
+                  val thr = 1.25 + 0.5 / Cfg.beatSens.toDouble().coerceAtLeast(0.1)
+                  val minGap = if (period > 0.0) max(0.22, period * 0.55) else 0.25
+                  if (ehFill >= BH / 2 && avg > 0.0 && e > avg * thr && e > 1e-4 &&
+                      sinceBeat > minGap && e >= ePrev
+                  ) {
+                      fireBeat(e / avg, thr)
+                  }
+                  ePrev = e
+              }
+
+              private fun fireBeat(ratio: Double, thr: Double) {
+                  val t = framesTotal / sr.toDouble()
+                  if (t - lastBeatT > 2.0) {
+                      // silence or a new section: restart bar counting
+                      beatIdx = 0; barIdx = 0; downPhase = 0; btN = 0
+                      java.util.Arrays.fill(phaseAcc, 0f)
+                  }
+                  if (btN < BT) {
+                      bt[btN++] = t
+                  } else {
+                      System.arraycopy(bt, 1, bt, 0, BT - 1)
+                      bt[BT - 1] = t
+                  }
+                  lastBeatT = t
+                  sinceBeat = 0.0
+                  updateTempo()
+
+                  val str = (((ratio - thr) / 2.0).coerceIn(0.0, 1.0) * 0.7 + 0.3).toFloat()
+
+                  // bar position: the beat position (0..3) that keeps getting the loudest hits is "1"
+                  val ph = beatIdx % 4
+                  phaseAcc[ph] = phaseAcc[ph] * 0.8f + ratio.toFloat() * 0.2f
+                  var best = downPhase
+                  for (p in 0 until 4) {
+                      if (phaseAcc[p] > phaseAcc[best] * 1.15f) best = p
+                  }
+                  downPhase = best
+                  var kind = 0
+                  if (ph == downPhase) {
+                      barIdx++
+                      kind = if (barIdx % 8 == 0) 2 else 1
+                  }
+                  beatIdx++
+
+                  val ns = chunkNs + curFrame * 1_000_000_000L / sr
+                  AudioBus.pushBeat(ns, str, kind)
+              }
+
+              private fun updateTempo() {
+                  if (btN < 4) return
+                  val ibis = DoubleArray(btN - 1)
+                  for (i in 1 until btN) {
+                      var v = bt[i] - bt[i - 1]
+                      while (v < 0.37) v *= 2.0
+                      while (v >= 0.74) v /= 2.0
+                      ibis[i - 1] = v
+                  }
+                  ibis.sort()
+                  val med = ibis[ibis.size / 2]
+                  period = if (period > 0.0 && abs(med - period) / period < 0.12) period * 0.6 + med * 0.4 else med
+                  AudioBus.bpm = (60.0 / period).toFloat()
+                  AudioBus.bpmNs = System.nanoTime()
               }
           }
           KOTLIN_EOF
@@ -504,57 +781,82 @@ jobs:
           import android.graphics.Paint
           import android.graphics.Path
           import android.view.View
-          import kotlin.math.abs
           import kotlin.math.cos
           import kotlin.math.exp
           import kotlin.math.floor
+          import kotlin.math.max
           import kotlin.math.min
           import kotlin.math.pow
           import kotlin.math.sin
+          import kotlin.math.sqrt
           import kotlin.random.Random
 
           /**
-           * Black disc in the center with layered "solar flare" rings + drifting particles.
-           *
-           * Layers (inside -> outside):
-           *   center + L1 : black   (merged, same colour)
-           *   L2          : white, semi glowing
-           *   L3          : black
-           *   L4          : white, semi glowing
-           *
-           * Every layer is driven ONLY by the 16-60 Hz bands in AudioBus.levels.
-           * The 12 bands are laid over the half circle and mirrored left/right:
-           *   bottom = 16 Hz ... top = 60 Hz.
-           * Outer layers use older (delayed) levels, so a kick ripples outward.
+           * Center: two flares (top = low end of the bass range, bottom = high end) in 4 overlapping
+           * layers black / white / black / white. Each layer reacts LAYER_STEP_MS later than the one
+           * inside it, so the outer layers trail like a tail.
+           * Mid range (default 1-4 kHz) makes the whole disc rock / wander randomly.
+           * Beats make the disc pop bigger and kick the particles away from the center.
+           * Bass makes the particles rumble in/out along their own path (subwoofer-port feel).
+           * Everything is tweakable in menu > Visualizer (see Cfg).
            */
           class VisualizerView(ctx: Context) : View(ctx) {
 
               @JvmField var playing = false
 
               companion object {
-                  // ---- tunables ----
-                  const val CONTRAST = 2.0f      // higher = only strong bass moves the rings
-                  const val ATTACK = 28f         // how fast rings rise
-                  const val DECAY = 5f           // how fast rings fall
-                  const val SYNC_FRAMES = 6      // compensates audio-buffer latency (~100 ms at 60 fps)
-                  const val HIST = 40
-                  const val PARTICLES = 160
+                  const val CONTRAST = 2.0f
+                  const val ATTACK = 28f
+                  const val DECAY = 5f
+                  const val LAYER_STEP_MS = 100          // delay between layers (the "tail")
+                  const val HIST = 128
+                  const val MAXP = 600
                   const val POINTS = 160
-                  val BASE_R = floatArrayOf(0.30f, 0.42f, 0.54f, 0.66f) // L1..L4 radius (x u)
-                  val FLARE = floatArrayOf(0.05f, 0.11f, 0.10f, 0.18f)  // max flare growth
-                  val DELAY = intArrayOf(0, 3, 6, 10)                   // frames of ripple delay
-                  val WHITE = booleanArrayOf(false, true, false, true)
+                  val BASE_R = floatArrayOf(0.28f, 0.36f, 0.44f, 0.52f) // inner -> outer (x u)
+                  val FLARE = floatArrayOf(0.12f, 0.18f, 0.22f, 0.26f)
+                  val WHITE = booleanArrayOf(false, true, false, true)  // black, white, black, white
                   val PIF = Math.PI.toFloat()
               }
 
               private val nb = AudioBus.BANDS
               private val sm = FloatArray(nb)
               private val hist = Array(HIST) { FloatArray(nb) }
+              private val hT = FloatArray(HIST)
+              private val hMid = FloatArray(HIST)
               private var head = 0
+              private var hCount = 0
               private var lastNs = 0L
               private var time = 0f
               private var energy = 0f
+              private var midBase = 0f
+              private var midSm = 0f
+              private var midPrev = 0f
               private val dens = ctx.resources.displayMetrics.density
+
+              // rocking motion
+              private var mx = 0f
+              private var my = 0f
+              private var mvx = 0f
+              private var mvy = 0f
+              private var mr = 0f
+              private var mvr = 0f
+              private var ox = 0f
+              private var oy = 0f
+              private var rot = 0f
+
+              // beats
+              private var pop = 0f
+              private var pendingScatter = 0f
+              private var lastSeen = AudioBus.beatHead
+              private val pendNs = LongArray(16)
+              private val pendS = FloatArray(16)
+              private val pendK = IntArray(16)
+              private var pendN = 0
+
+              // geometry
+              private var cx = 0f
+              private var cy = 0f
+              private var uu = 1f
 
               private val path = Path()
               private val fillWhite = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -568,12 +870,15 @@ jobs:
               }
               private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
 
-              private val px = FloatArray(PARTICLES) { Random.nextFloat() }
-              private val py = FloatArray(PARTICLES) { Random.nextFloat() }
-              private val psz = FloatArray(PARTICLES) { Random.nextFloat() * 2.5f + 0.6f }
-              private val pspd = FloatArray(PARTICLES) { Random.nextFloat() * 0.35f + 0.12f }
-              private val pph = FloatArray(PARTICLES) { Random.nextFloat() * 6.28f }
-              private val ptw = FloatArray(PARTICLES) { Random.nextFloat() * 1.2f + 0.4f }
+              private val px = FloatArray(MAXP) { Random.nextFloat() }
+              private val py = FloatArray(MAXP) { Random.nextFloat() }
+              private val psz = FloatArray(MAXP) { Random.nextFloat() * 2.5f + 0.6f }
+              private val pspd = FloatArray(MAXP) { Random.nextFloat() * 0.35f + 0.12f }
+              private val pph = FloatArray(MAXP) { Random.nextFloat() * 6.28f }
+              private val ptw = FloatArray(MAXP) { Random.nextFloat() * 1.2f + 0.4f }
+              private val pjit = FloatArray(MAXP) { Random.nextFloat() }
+              private val sc = FloatArray(MAXP)   // scatter offset (px, along the line from the center)
+              private val sv = FloatArray(MAXP)   // scatter velocity
 
               override fun onDraw(canvas: Canvas) {
                   val w = width.toFloat()
@@ -583,35 +888,167 @@ jobs:
                   val dt = if (lastNs == 0L) 0.016f else ((now - lastNs) / 1_000_000_000f).coerceIn(0.001f, 0.05f)
                   lastNs = now
                   time += dt
+                  cx = w / 2f
+                  cy = h * 0.40f
+                  uu = min(w * 0.5f, h * 0.32f)
+
                   updateLevels(dt, now)
-                  drawParticles(canvas, w, h)
-                  drawRings(canvas, w, h)
+                  processBeats(now, dt)
+                  updateMotion(dt)
+                  drawParticles(canvas, w, h, dt)
+                  drawRings(canvas)
                   postInvalidateOnAnimation()
               }
 
+              // ------------------------------------------------------------ levels + history
               private fun updateLevels(dt: Float, now: Long) {
                   val fresh = playing && (now - AudioBus.lastUpdateNs) < 250_000_000L
                   val ka = 1f - exp(-dt * ATTACK)
                   val kd = 1f - exp(-dt * DECAY)
+                  val sens = Cfg.bassSens
                   var sum = 0f
                   for (i in 0 until nb) {
                       val raw = if (fresh) AudioBus.levels[i] else 0f
-                      val t = raw.pow(CONTRAST)
+                      val t = (raw * sens).coerceIn(0f, 1.5f).pow(CONTRAST)
                       sm[i] += (t - sm[i]) * (if (t > sm[i]) ka else kd)
                       sum += sm[i]
                   }
                   energy = sum / nb
+
+                  // mid: look at the change versus a slow baseline so it moves with the music, not constantly
+                  val midRaw = if (fresh) AudioBus.mid else 0f
+                  midBase += (midRaw - midBase) * min(1f, dt / 4f)
+                  val m = if (fresh) (((midRaw - midBase) * 4f + 0.3f) * Cfg.midSens).coerceIn(0f, 1.2f) else 0f
+                  midSm += (m - midSm) * (1f - exp(-dt * (if (m > midSm) 20f else 4f)))
+
                   head = (head + 1) % HIST
                   System.arraycopy(sm, 0, hist[head], 0, nb)
+                  hT[head] = time
+                  hMid[head] = midSm
+                  if (hCount < HIST) hCount++
               }
 
-              private fun drawParticles(canvas: Canvas, w: Float, h: Float) {
-                  for (i in 0 until PARTICLES) {
-                      val x = px[i] * w + sin(time * pspd[i] + pph[i]) * 14f * dens
-                      val y = py[i] * h + cos(time * pspd[i] * 0.8f + pph[i]) * 18f * dens
+              /** Index of the newest history frame that is not newer than tTarget (seconds). */
+              private fun idxAt(tTarget: Float): Int {
+                  var i = head
+                  var n = 0
+                  while (n < hCount) {
+                      if (hT[i] <= tTarget) return i
+                      i = (i - 1 + HIST) % HIST
+                      n++
+                  }
+                  return (head - hCount + 1 + HIST) % HIST
+              }
+
+              // ------------------------------------------------------------ beats
+              private fun processBeats(now: Long, dt: Float) {
+                  val headNow = AudioBus.beatHead
+                  if (headNow != lastSeen) {
+                      var i = max(lastSeen, headNow - AudioBus.QN)
+                      while (i < headNow) {
+                          val k = i % AudioBus.QN
+                          val ns = AudioBus.beatNs[k]
+                          if (now - ns < 1_500_000_000L && pendN < 16) {
+                              pendNs[pendN] = ns + Cfg.syncMs * 1_000_000L
+                              pendS[pendN] = AudioBus.beatStr[k]
+                              pendK[pendN] = AudioBus.beatKind[k]
+                              pendN++
+                          }
+                          i++
+                      }
+                      lastSeen = headNow
+                  }
+                  var j = 0
+                  while (j < pendN) {
+                      if (pendNs[j] <= now) {
+                          fireBeat(pendS[j], pendK[j])
+                          pendN--
+                          pendNs[j] = pendNs[pendN]
+                          pendS[j] = pendS[pendN]
+                          pendK[j] = pendK[pendN]
+                      } else {
+                          j++
+                      }
+                  }
+                  pop *= exp(-dt * 6.5f)
+              }
+
+              private fun fireBeat(str: Float, kind: Int) {
+                  val mult = when (kind) {
+                      1 -> 1.5f
+                      2 -> 2.1f
+                      else -> 1f
+                  }
+                  val v = str * mult
+                  if (v > pop) pop = v
+                  pendingScatter += v * Cfg.scatter
+              }
+
+              // ------------------------------------------------------------ rocking motion
+              private fun updateMotion(dt: Float) {
+                  val mLvl = hMid[idxAt(time - Cfg.syncMs / 1000f)]
+                  val dm = mLvl - midPrev
+                  midPrev = mLvl
+                  val mv = Cfg.midMove
+                  if (dm > 0.05f && mv > 0f) {
+                      val ang = Random.nextFloat() * 2f * PIF
+                      val mag = dm * mv
+                      mvx += cos(ang) * mag * 2.8f * uu
+                      mvy += sin(ang) * mag * 2.8f * uu
+                      mvr += (Random.nextFloat() - 0.5f) * mag * 8f
+                  }
+                  mvx += (-12f * mx - 4.5f * mvx) * dt
+                  mvy += (-12f * my - 4.5f * mvy) * dt
+                  mvr += (-10f * mr - 4f * mvr) * dt
+                  mx = (mx + mvx * dt).coerceIn(-0.25f * uu, 0.25f * uu)
+                  my = (my + mvy * dt).coerceIn(-0.25f * uu, 0.25f * uu)
+                  mr = (mr + mvr * dt).coerceIn(-0.5f, 0.5f)
+
+                  // slow random drift on top (sums of unrelated sines), scaled by mid loudness
+                  val wx = (sin(time * 0.61f + 1.3f) + 0.6f * sin(time * 1.07f + 4.2f)) * 0.5f
+                  val wy = (sin(time * 0.53f + 2.1f) + 0.6f * sin(time * 0.91f + 0.4f)) * 0.5f
+                  val wr = sin(time * 0.43f + 0.7f)
+                  val amp = mLvl * mv
+                  ox = mx + wx * uu * 0.10f * amp
+                  oy = my + wy * uu * 0.10f * amp
+                  rot = mr + wr * 0.25f * amp
+              }
+
+              // ------------------------------------------------------------ particles
+              private fun drawParticles(canvas: Canvas, w: Float, h: Float, dt: Float) {
+                  val n = Cfg.pCount.coerceIn(10, MAXP)
+                  val imp = pendingScatter
+                  pendingScatter = 0f
+                  val hh = hist[idxAt(time - Cfg.syncMs / 1000f)]
+                  var be = 0f
+                  for (i in 0 until nb) be += hh[i]
+                  be /= nb
+                  val rum = Cfg.pRumble * be * 2.2f
+                  val sizeMul = Cfg.pSize
+
+                  for (i in 0 until n) {
+                      val bx = px[i] * w + sin(time * pspd[i] + pph[i]) * 14f * dens
+                      val by = py[i] * h + cos(time * pspd[i] * 0.8f + pph[i]) * 18f * dens
+                      val dx = bx - cx
+                      val dy = by - cy
+                      val dist = sqrt(dx * dx + dy * dy) + 1f
+                      val ux = dx / dist
+                      val uy = dy / dist
+                      val infl = 1f / (1f + dist / (0.9f * uu))
+
+                      if (imp > 0f) sv[i] += imp * 380f * dens * (0.5f + pjit[i]) * infl * 1.6f
+                      sv[i] += (-6f * sc[i] - 3.2f * sv[i]) * dt
+                      sc[i] += sv[i] * dt
+
+                      val osc = sin(time * (14f + pjit[i] * 10f) + pph[i] * 3f)
+                      val off = sc[i] + rum * 14f * dens * osc * infl
+                      val perp = rum * 4f * dens * sin(time * 23f + pph[i] * 5f) * infl
+                      val x = bx + ux * off - uy * perp
+                      val y = by + uy * off + ux * perp
+
                       val tw = 0.5f + 0.5f * sin(time * ptw[i] + pph[i])
-                      val a = (0.15f + 0.5f * tw + energy * 0.35f).coerceIn(0f, 1f)
-                      val r = psz[i] * dens * 0.5f * (1f + energy * 0.6f)
+                      val a = (0.15f + 0.5f * tw + energy * 0.35f + pop * 0.25f).coerceIn(0f, 1f)
+                      val r = psz[i] * dens * 0.5f * sizeMul * (1f + be * 0.5f)
                       if (psz[i] > 1.6f) {
                           dot.alpha = (a * 70f).toInt()
                           canvas.drawCircle(x, y, r * 2.6f, dot)
@@ -621,29 +1058,31 @@ jobs:
                   }
               }
 
-              private fun drawRings(canvas: Canvas, w: Float, h: Float) {
-                  val cx = w / 2f
-                  val cy = h * 0.40f
-                  val u = min(w * 0.5f, h * 0.32f)
-                  val pulse = 1f + 0.05f * energy
-                  val glowGain = 0.6f + 0.8f * energy
+              // ------------------------------------------------------------ rings
+              private fun drawRings(canvas: Canvas) {
+                  val ccx = cx + ox
+                  val ccy = cy + oy
+                  val scale = 1f + (0.16f * pop * Cfg.popStrength).coerceAtMost(0.5f)
+                  val pulse = 1f + 0.04f * energy
+                  val glowGain = 0.6f + 0.8f * energy + 0.5f * pop
 
                   for (l in 3 downTo 0) {
-                      val hh = hist[(head - DELAY[l] - SYNC_FRAMES + HIST * 2) % HIST]
+                      val hh = hist[idxAt(time - (Cfg.syncMs + l * LAYER_STEP_MS) / 1000f)]
                       path.reset()
                       for (k in 0 until POINTS) {
                           val a = (k.toFloat() / POINTS) * 2f * PIF
-                          val f = if (a <= PIF) a / PIF else (2f * PIF - a) / PIF
-                          val bp = f * (nb - 1)
+                          // a = 0 is the bottom, a = PI is the top. t = 0 at the top (low Hz), 1 at the bottom (high Hz)
+                          val t = 0.5f + 0.5f * cos(a - rot)
+                          val bp = t * (nb - 1)
                           val i0 = min(floor(bp).toInt(), nb - 2)
                           val fr = bp - i0
                           val s = fr * fr * (3f - 2f * fr)
                           val v = hh[i0] + (hh[i0 + 1] - hh[i0]) * s
                           val wob = 0.014f * sin(5f * a + time * 0.9f + l.toFloat()) +
                               0.009f * sin(3f * a - time * 0.6f)
-                          val r = u * (BASE_R[l] * pulse + FLARE[l] * v + wob * 0.6f)
-                          val x = cx + r * sin(a)
-                          val y = cy + r * cos(a)
+                          val r = uu * scale * (BASE_R[l] * pulse + FLARE[l] * v + wob * 0.6f)
+                          val x = ccx + r * sin(a)
+                          val y = ccy + r * cos(a)
                           if (k == 0) path.moveTo(x, y) else path.lineTo(x, y)
                       }
                       path.close()
@@ -805,7 +1244,7 @@ jobs:
           // ---------------------------------------------------------------- data
           data class Track(val id: Long, val title: String, val artist: String, val durMs: Long, val uri: Uri)
 
-          enum class Panel { None, List, Menu, Eq }
+          enum class Panel { None, List, Menu, Eq, Viz }
 
           fun scanTracks(ctx: Context): List<Track> {
               val list = ArrayList<Track>()
@@ -865,6 +1304,17 @@ jobs:
 
               init {
                   loadEq()
+                  Cfg.load(prefs)
+              }
+
+              fun saveCfg() {
+                  Cfg.rangeVersion++
+                  Cfg.save(prefs)
+              }
+
+              fun resetCfg() {
+                  Cfg.reset()
+                  saveCfg()
               }
 
               fun attach(c: MediaController) {
@@ -1076,6 +1526,12 @@ jobs:
           }
 
           @Composable
+          fun IconViz() = Ico(20.dp) {
+              drawCircle(Color.White, 9f, Offset(12f, 12f), style = androidx.compose.ui.graphics.drawscope.Stroke(2f))
+              drawCircle(Color.White, 4.5f, Offset(12f, 12f), style = androidx.compose.ui.graphics.drawscope.Stroke(2f))
+          }
+
+          @Composable
           fun IconScan() = Ico(20.dp) {
               val c = Color.White
               ln(c, 3f, 7f, 3f, 3f, 2f); ln(c, 3f, 3f, 7f, 3f, 2f)
@@ -1208,8 +1664,12 @@ jobs:
                           Overlay(panel == Panel.Menu) {
                               MenuPanel(
                                   onEq = { panel = Panel.Eq },
+                                  onViz = { panel = Panel.Viz },
                                   onScan = { panel = Panel.None; requestAndScan(true) }
                               )
+                          }
+                          Overlay(panel == Panel.Viz) {
+                              VizPanel(vm)
                           }
                           Overlay(panel == Panel.Eq) {
                               EqPanel(vm) { idx -> pendingDelete = idx }
@@ -1327,9 +1787,10 @@ jobs:
 
           // ---------------------------------------------------------------- menu
           @Composable
-          fun MenuPanel(onEq: () -> Unit, onScan: () -> Unit) {
+          fun MenuPanel(onEq: () -> Unit, onViz: () -> Unit, onScan: () -> Unit) {
               Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                   MenuRow("Equalizer", "Add bands and shape the sound", onEq) { IconEq() }
+                  MenuRow("Visualizer", "Bass, motion, beat and particles", onViz) { IconViz() }
                   MenuRow("Scan Files", "Find songs on this device", onScan) { IconScan() }
               }
           }
@@ -1347,6 +1808,145 @@ jobs:
                   Column(Modifier.padding(start = 14.dp)) {
                       Text(title, color = CText, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                       Text(sub, color = CDim, fontSize = 11.sp)
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- visualizer settings
+          @Composable
+          fun SliderRow(label: String, valueText: String, frac: Float, onFrac: (Float) -> Unit) {
+              val cb by rememberUpdatedState(onFrac)
+              var wPx by remember { mutableStateOf(1f) }
+              val f = frac.coerceIn(0f, 1f)
+              Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp)) {
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                      Text(label, color = Color(0xCCFFFFFF), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                      Text(valueText, color = CDim, fontSize = 11.sp)
+                  }
+                  Box(
+                      Modifier
+                          .fillMaxWidth()
+                          .height(30.dp)
+                          .onSizeChanged { wPx = it.width.toFloat().coerceAtLeast(1f) }
+                          .pointerInput(Unit) { detectTapGestures { o -> cb((o.x / wPx).coerceIn(0f, 1f)) } }
+                          .pointerInput(Unit) {
+                              detectHorizontalDragGestures(
+                                  onDragStart = { o -> cb((o.x / wPx).coerceIn(0f, 1f)) },
+                                  onHorizontalDrag = { ch, _ -> cb((ch.position.x / wPx).coerceIn(0f, 1f)) }
+                              )
+                          },
+                      contentAlignment = Alignment.CenterStart
+                  ) {
+                      Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(99.dp)).background(CSurf3))
+                      Box(Modifier.fillMaxWidth(f).height(4.dp).clip(RoundedCornerShape(99.dp)).background(Color(0xCCFFFFFF)))
+                      Box(
+                          Modifier
+                              .offset { IntOffset((f * wPx - 7.dp.toPx()).roundToInt(), 0) }
+                              .size(14.dp).clip(CircleShape).background(Color.White)
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun SectionTitle(t: String, sub: String) {
+              Column(Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, top = 16.dp, bottom = 2.dp)) {
+                  Text(t.uppercase(), color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
+                  Text(sub, color = CDim, fontSize = 10.sp)
+              }
+          }
+
+          @Composable
+          fun VizPanel(vm: PlayerVm) {
+              var tick by remember { mutableStateOf(0) }
+              val t = tick // read so the sliders redraw
+              fun changed() { tick++; vm.saveCfg() }
+
+              fun lin(v: Float, lo: Float, hi: Float) = (v - lo) / (hi - lo)
+              fun unlin(f: Float, lo: Float, hi: Float) = lo + f * (hi - lo)
+              // log scale for Hz ranges (a bit more room at the low end)
+              fun logF(v: Int, lo: Float, hi: Float) = (Math.log((v / lo).toDouble()) / Math.log((hi / lo).toDouble())).toFloat()
+              fun unlogF(f: Float, lo: Float, hi: Float) = (lo * Math.pow((hi / lo).toDouble(), f.toDouble())).roundToInt()
+
+              Column(Modifier.fillMaxSize()) {
+                  Row(
+                      Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 6.dp, bottom = 4.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Column(Modifier.weight(1f)) {
+                          Text("Visualizer", color = CText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                          Text("SETTINGS SAVE AUTOMATICALLY", color = CDim, fontSize = 10.sp, letterSpacing = 0.6.sp)
+                      }
+                      Box(
+                          Modifier.height(34.dp).clip(RoundedCornerShape(10.dp)).background(Color(0x14FFFFFF))
+                              .tap { vm.resetCfg(); tick++ }.padding(horizontal = 14.dp),
+                          contentAlignment = Alignment.Center
+                      ) { Text("Reset", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                  }
+                  LazyColumn(Modifier.weight(1f).fillMaxWidth()) {
+                      item {
+                        Column(Modifier.fillMaxWidth()) {
+                          val bass = t
+                          SectionTitle("Bass (center flares)", "Top flare = low end, bottom flare = high end")
+                          SliderRow("Low end (top)", Cfg.bassLo.toString() + " Hz", logF(Cfg.bassLo, 5f, 100f)) {
+                              Cfg.bassLo = unlogF(it, 5f, 100f).coerceIn(5, 100)
+                              if (Cfg.bassHi < Cfg.bassLo + 5) Cfg.bassHi = Cfg.bassLo + 5
+                              changed()
+                          }
+                          SliderRow("High end (bottom)", Cfg.bassHi.toString() + " Hz", logF(Cfg.bassHi, 20f, 250f)) {
+                              Cfg.bassHi = unlogF(it, 20f, 250f).coerceIn(20, 250)
+                              if (Cfg.bassHi < Cfg.bassLo + 5) Cfg.bassLo = (Cfg.bassHi - 5).coerceAtLeast(5)
+                              changed()
+                          }
+                          SliderRow("Sensitivity", "%.2fx".format(Cfg.bassSens), lin(Cfg.bassSens, 0.2f, 3f)) {
+                              Cfg.bassSens = unlin(it, 0.2f, 3f); changed()
+                          }
+
+                          SectionTitle("Mid motion (rocking)", "The center moves randomly with this range")
+                          SliderRow("Low end", Cfg.midLo.toString() + " Hz", logF(Cfg.midLo, 200f, 6000f)) {
+                              Cfg.midLo = unlogF(it, 200f, 6000f).coerceIn(200, 6000)
+                              if (Cfg.midHi < Cfg.midLo + 200) Cfg.midHi = Cfg.midLo + 200
+                              changed()
+                          }
+                          SliderRow("High end", Cfg.midHi.toString() + " Hz", logF(Cfg.midHi, 400f, 12000f)) {
+                              Cfg.midHi = unlogF(it, 400f, 12000f).coerceIn(400, 12000)
+                              if (Cfg.midHi < Cfg.midLo + 200) Cfg.midLo = (Cfg.midHi - 200).coerceAtLeast(200)
+                              changed()
+                          }
+                          SliderRow("Sensitivity", "%.2fx".format(Cfg.midSens), lin(Cfg.midSens, 0.2f, 3f)) {
+                              Cfg.midSens = unlin(it, 0.2f, 3f); changed()
+                          }
+                          SliderRow("Movement amount", "%.2fx".format(Cfg.midMove), lin(Cfg.midMove, 0f, 2f)) {
+                              Cfg.midMove = unlin(it, 0f, 2f); changed()
+                          }
+
+                          SectionTitle("Beat", "Center pops bigger, particles scatter away")
+                          SliderRow("Detection sensitivity", "%.2fx".format(Cfg.beatSens), lin(Cfg.beatSens, 0.3f, 3f)) {
+                              Cfg.beatSens = unlin(it, 0.3f, 3f); changed()
+                          }
+                          SliderRow("Pop strength", "%.2fx".format(Cfg.popStrength), lin(Cfg.popStrength, 0f, 2.5f)) {
+                              Cfg.popStrength = unlin(it, 0f, 2.5f); changed()
+                          }
+                          SliderRow("Scatter strength", "%.2fx".format(Cfg.scatter), lin(Cfg.scatter, 0f, 3f)) {
+                              Cfg.scatter = unlin(it, 0f, 3f); changed()
+                          }
+                          SliderRow("Sync offset", Cfg.syncMs.toString() + " ms", lin(Cfg.syncMs.toFloat(), 0f, 400f)) {
+                              Cfg.syncMs = unlin(it, 0f, 400f).roundToInt(); changed()
+                          }
+
+                          SectionTitle("Particles", "")
+                          SliderRow("Size", "%.2fx".format(Cfg.pSize), lin(Cfg.pSize, 0.3f, 3f)) {
+                              Cfg.pSize = unlin(it, 0.3f, 3f); changed()
+                          }
+                          SliderRow("Rumble sensitivity", "%.2fx".format(Cfg.pRumble), lin(Cfg.pRumble, 0f, 3f)) {
+                              Cfg.pRumble = unlin(it, 0f, 3f); changed()
+                          }
+                          SliderRow("Density", Cfg.pCount.toString(), lin(Cfg.pCount.toFloat(), 10f, 600f)) {
+                              Cfg.pCount = unlin(it, 10f, 600f).roundToInt(); changed()
+                          }
+                          Box(Modifier.height(20.dp))
+                        }
+                      }
                   }
               }
           }
@@ -1579,191 +2179,4 @@ jobs:
                       horizontalAlignment = Alignment.CenterHorizontally
                   ) {
                       Box(
-                          Modifier.size(52.dp).clip(CircleShape).background(Color(0x22FF6B81)),
-                          contentAlignment = Alignment.Center
-                      ) { IconTrash() }
-                      Box(Modifier.height(14.dp))
-                      Text("Delete band?", color = CText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                      Box(Modifier.height(6.dp))
-                      Text(
-                          "Remove the " + freq + " Hz band from your equalizer?",
-                          color = CDim, fontSize = 13.sp, textAlign = TextAlign.Center, lineHeight = 19.sp
-                      )
-                      Box(Modifier.height(18.dp))
-                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                          Box(
-                              Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(12.dp))
-                                  .background(Color(0x14FFFFFF)).tap(onCancel),
-                              contentAlignment = Alignment.Center
-                          ) { Text("Cancel", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
-                          Box(
-                              Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(12.dp))
-                                  .background(CHeart).tap(onDelete),
-                              contentAlignment = Alignment.Center
-                          ) { Text("Delete", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
-                      }
-                  }
-              }
-          }
-
-          // ---------------------------------------------------------------- bottom controls
-          @Composable
-          fun Controls(vm: PlayerVm) {
-              Column(
-                  Modifier
-                      .fillMaxWidth()
-                      .navigationBarsPadding()
-                      .padding(start = 22.dp, end = 22.dp, bottom = 24.dp)
-              ) {
-                  Column(Modifier.fillMaxWidth().padding(bottom = 20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                      Text(
-                          vm.title, color = CText, fontSize = 20.sp, fontWeight = FontWeight.Bold,
-                          maxLines = 1, overflow = TextOverflow.Ellipsis
-                      )
-                      Text(vm.artist, color = CDim, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                  }
-                  SeekBar(vm)
-                  Box(Modifier.height(22.dp))
-                  Row(
-                      Modifier.fillMaxWidth(),
-                      horizontalArrangement = Arrangement.spacedBy(28.dp, Alignment.CenterHorizontally),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
-                      Box(Modifier.size(44.dp).tap { vm.prev() }, contentAlignment = Alignment.Center) { IconPrev() }
-                      Box(
-                          Modifier
-                              .size(68.dp)
-                              .clip(CircleShape)
-                              .background(Brush.linearGradient(listOf(Color(0xFFF7F7FA), Color(0xFFC9C9D2))))
-                              .tap { vm.togglePlay() },
-                          contentAlignment = Alignment.Center
-                      ) {
-                          if (vm.isPlaying) IconPause(Color(0xFF0E0E10), 30.dp) else IconPlay(Color(0xFF0E0E10), 30.dp)
-                      }
-                      Box(Modifier.size(44.dp).tap { vm.next() }, contentAlignment = Alignment.Center) { IconNext() }
-                  }
-              }
-          }
-
-          @Composable
-          fun SeekBar(vm: PlayerVm) {
-              var drag by remember { mutableStateOf<Float?>(null) }
-              var wPx by remember { mutableStateOf(1f) }
-              val d = drag
-              val frac = d ?: if (vm.durMs > 0) (vm.posMs.toFloat() / vm.durMs).coerceIn(0f, 1f) else 0f
-              Column(Modifier.fillMaxWidth()) {
-                  Box(
-                      Modifier
-                          .fillMaxWidth()
-                          .height(28.dp)
-                          .onSizeChanged { wPx = it.width.toFloat().coerceAtLeast(1f) }
-                          .pointerInput(Unit) {
-                              detectTapGestures { o -> vm.seekFrac((o.x / wPx).coerceIn(0f, 1f)) }
-                          }
-                          .pointerInput(Unit) {
-                              detectHorizontalDragGestures(
-                                  onDragStart = { o -> drag = (o.x / wPx).coerceIn(0f, 1f) },
-                                  onDragEnd = {
-                                      val v = drag
-                                      if (v != null) vm.seekFrac(v)
-                                      drag = null
-                                  },
-                                  onDragCancel = { drag = null },
-                                  onHorizontalDrag = { ch, _ -> drag = (ch.position.x / wPx).coerceIn(0f, 1f) }
-                              )
-                          },
-                      contentAlignment = Alignment.CenterStart
-                  ) {
-                      Box(Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(99.dp)).background(CSurf3))
-                      Box(
-                          Modifier.fillMaxWidth(frac).height(6.dp).clip(RoundedCornerShape(99.dp))
-                              .background(Brush.horizontalGradient(listOf(Color(0xFFF5F5F7), Color(0xFFB8B8C2))))
-                      )
-                      Box(
-                          Modifier
-                              .offset { IntOffset((frac * wPx - 7.dp.toPx()).roundToInt(), 0) }
-                              .size(14.dp)
-                              .clip(CircleShape)
-                              .background(Color.White)
-                      )
-                  }
-                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                      Text(fmtMs((frac * vm.durMs).toLong()), color = CDim, fontSize = 11.sp)
-                      Text(fmtMs(vm.durMs), color = CDim, fontSize = 11.sp)
-                  }
-              }
-          }
-          KOTLIN_EOF
-
-      - name: Generate dummy keystore
-        run: |
-          keytool -genkeypair -v -keystore app/dummy.keystore -alias dummy \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass password -keypass password \
-            -dname "CN=GreyPulse, OU=Dev, O=Grey, L=NA, S=NA, C=US"
-
-      - name: Generate launcher icons
-        run: |
-          python3 -c "import PIL" 2>/dev/null || pip install --quiet --break-system-packages pillow
-          python3 - << 'PY'
-          from PIL import Image, ImageDraw
-          import os
-
-          sizes = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
-
-          def make(sz, rnd):
-              S = sz * 4
-              im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-              d = ImageDraw.Draw(im)
-              bg = (24, 24, 27, 255)
-              if rnd:
-                  d.ellipse((0, 0, S - 1, S - 1), fill=bg)
-              else:
-                  d.rounded_rectangle((0, 0, S - 1, S - 1), radius=int(S * 0.22), fill=bg)
-              c = S / 2
-              for r, col in ((0.40, (235, 235, 240, 255)), (0.32, (0, 0, 0, 255)),
-                             (0.24, (235, 235, 240, 255)), (0.15, (0, 0, 0, 255))):
-                  d.ellipse((c - r * S, c - r * S, c + r * S, c + r * S), fill=col)
-              return im.resize((sz, sz), Image.LANCZOS)
-
-          for name, sz in sizes.items():
-              folder = "app/src/main/res/mipmap-" + name
-              os.makedirs(folder, exist_ok=True)
-              make(sz, False).save(folder + "/ic_launcher.png")
-              make(sz, True).save(folder + "/ic_launcher_round.png")
-          PY
-
-      - name: Gradle wrapper
-        run: gradle wrapper --gradle-version 8.11.1 --no-daemon
-
-      - name: Build release APK
-        run: |
-          chmod +x gradlew
-          ./gradlew clean assembleRelease --no-daemon
-
-      - name: Verify APK signature
-        run: |
-          APK=app/build/outputs/apk/release/app-arm64-v8a-release.apk
-          ls -la app/build/outputs/apk/release/
-          BT=$(ls -d /usr/local/lib/android/sdk/build-tools/* | sort -V | tail -1)
-          "$BT/apksigner" verify --verbose "$APK"
-
-      - name: Bundle output
-        run: |
-          mkdir -p bundle
-          cp app/build/outputs/apk/release/app-arm64-v8a-release.apk bundle/GreyPulse.apk
-          cp -r app/src bundle/source
-          cp .github/workflows/build.yml bundle/build.yml
-          {
-            echo "App: GreyPulse (com.grey.pulse)"
-            echo "Build number: ${BUILD_NUMBER}"
-            echo "Commit: ${GITHUB_SHA}"
-            echo "Built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          } > bundle/BUILD_INFO.txt
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: GreyPulse-${{ github.run_number }}
-          path: bundle
-          retention-days: 30
+                   
