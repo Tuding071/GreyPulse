@@ -269,8 +269,10 @@ jobs:
               @Volatile var pCount = 160
               @Volatile var pRumble = 1f
               @Volatile var rangeVersion = 0     // bump when a Hz range changes (processor retunes)
+              @Volatile var useMap = true        // use the saved analysis (stems) when a song has one
 
               fun reset() {
+                  useMap = true
                   bassLo = 16; bassHi = 60; bassSens = 1f
                   midLo = 1000; midHi = 4000; midSens = 1f; midMove = 1f
                   beatSens = 1f; popStrength = 1f; scatter = 1f; syncMs = 120
@@ -292,6 +294,7 @@ jobs:
                   pSize = p.getFloat("c_pSize", 1f)
                   pCount = p.getInt("c_pCount", 160)
                   pRumble = p.getFloat("c_pRumble", 1f)
+                  useMap = p.getBoolean("c_useMap", true)
                   if (bassHi < bassLo + 5) bassHi = bassLo + 5
                   if (midHi < midLo + 200) midHi = midLo + 200
                   rangeVersion++
@@ -304,6 +307,7 @@ jobs:
                       .putFloat("c_midMove", midMove).putFloat("c_beatSens", beatSens)
                       .putFloat("c_pop", popStrength).putFloat("c_scatter", scatter).putInt("c_sync", syncMs)
                       .putFloat("c_pSize", pSize).putInt("c_pCount", pCount).putFloat("c_pRumble", pRumble)
+                      .putBoolean("c_useMap", useMap)
                       .apply()
               }
           }
@@ -710,6 +714,111 @@ jobs:
           }
           KOTLIN_EOF
 
+          cat > app/src/main/java/com/grey/pulse/Dbg.kt << 'KOTLIN_EOF'
+          package com.grey.pulse
+
+          import android.content.Context
+          import android.os.Build
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.ArrayDeque
+          import java.util.Date
+          import java.util.Locale
+
+          /**
+           * In-app log for troubleshooting (menu > Log). Keeps the last 700 lines in memory, appends them to
+           * a file (so the end of a crashed session survives), and can append this process's system log.
+           */
+          object Dbg {
+              private val buf = ArrayDeque<String>()
+              private val fmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+              private var file: File? = null
+              private var prevTail = ""
+
+              @Synchronized
+              fun init(ctx: Context) {
+                  if (file != null) return
+                  val dir = ctx.filesDir
+                  val cur = File(dir, "log.txt")
+                  val prev = File(dir, "log.prev.txt")
+                  try {
+                      if (cur.exists()) {
+                          prevTail = cur.readLines().takeLast(150).joinToString("\n")
+                          if (prev.exists()) prev.delete()
+                          cur.renameTo(prev)
+                      }
+                  } catch (e: Exception) {
+                  }
+                  file = cur
+                  log("---- GreyPulse start ----")
+                  try {
+                      val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                      log(
+                          "device=" + Build.MANUFACTURER + " " + Build.MODEL + " android=" + Build.VERSION.RELEASE +
+                              " sdk=" + Build.VERSION.SDK_INT + " abi=" + Build.SUPPORTED_ABIS.joinToString(",")
+                      )
+                      log(
+                          "memClass=" + am.memoryClass + "MB large=" + am.largeMemoryClass + "MB maxHeap=" +
+                              (Runtime.getRuntime().maxMemory() / 1048576) + "MB cores=" + Runtime.getRuntime().availableProcessors()
+                      )
+                  } catch (e: Exception) {
+                  }
+                  val old = Thread.getDefaultUncaughtExceptionHandler()
+                  Thread.setDefaultUncaughtExceptionHandler { t, e ->
+                      log("CRASH in thread " + t.name + ": " + stack(e))
+                      old?.uncaughtException(t, e)
+                  }
+              }
+
+              fun stack(e: Throwable): String {
+                  val top = e.stackTrace.take(8).joinToString(" <- ") {
+                      it.className.substringAfterLast('.') + "." + it.methodName + ":" + it.lineNumber
+                  }
+                  return e.javaClass.name + ": " + e.message + " | " + top
+              }
+
+              @Synchronized
+              fun log(msg: String) {
+                  val line = fmt.format(Date()) + " " + msg
+                  buf.addLast(line)
+                  while (buf.size > 700) buf.removeFirst()
+                  android.util.Log.i("GreyPulse", msg)
+                  try {
+                      val f = file
+                      if (f != null && f.length() < 400_000L) f.appendText(line + "\n")
+                  } catch (e: Exception) {
+                  }
+              }
+
+              fun err(msg: String, t: Throwable) = log("ERROR " + msg + ": " + stack(t))
+
+              @Synchronized
+              private fun current(): String = buf.joinToString("\n")
+
+              private fun system(): String {
+                  return try {
+                      val pid = android.os.Process.myPid()
+                      val p = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-t", "400", "--pid=" + pid, "*:W"))
+                      val s = p.inputStream.bufferedReader().use { it.readText() }
+                      if (s.isBlank()) "(nothing)" else s.takeLast(12000)
+                  } catch (e: Exception) {
+                      "(could not read system log: " + e.message + ")"
+                  }
+              }
+
+              /** Everything the Log screen shows and Copy copies. Blocking: call off the main thread. */
+              fun full(): String {
+                  val sb = StringBuilder()
+                  if (prevTail.isNotEmpty()) {
+                      sb.append("==== previous session (last lines) ====\n").append(prevTail).append("\n\n")
+                  }
+                  sb.append("==== this session ====\n").append(current()).append("\n\n")
+                  sb.append("==== system log, warnings and errors of this app ====\n").append(system())
+                  return sb.toString()
+              }
+          }
+          KOTLIN_EOF
+
           cat > app/src/main/java/com/grey/pulse/BeatMap.kt << 'KOTLIN_EOF'
           package com.grey.pulse
 
@@ -907,6 +1016,10 @@ jobs:
                   var cur = end
                   while (cur >= 0) { beatsRev.add(cur); cur = prev[cur] }
                   val beats = beatsRev.reversed()
+                  Dbg.log(
+                      "tracker: tempo=" + "%.1f".format(bpm) + " bpm, beat grid=" + beats.size + " beats over " +
+                          "%.0f".format(n / SongMap.FPS) + "s (expected about " + "%.0f".format(n / tT) + ")"
+                  )
 
                   // ---- kick hits: peaks of the onset strength
                   val os = FloatArray(n) { o[it].toFloat() }
@@ -928,6 +1041,7 @@ jobs:
                       }
                   }
 
+                  Dbg.log("tracker: kick hits=" + ev.size + " (p95 onset=" + "%.3f".format(p95) + ")")
                   // ---- bars and phrases: the beat position (0..3) with the strongest kicks is the "1"
                   if (beats.size >= 8) {
                       val sum = DoubleArray(4)
@@ -942,6 +1056,10 @@ jobs:
                           val mm = if (cnt[q] > 0) sum[q] / cnt[q] else 0.0
                           if (mm > bm) { bm = mm; down = q }
                       }
+                      Dbg.log(
+                          "tracker: downbeat position=" + down + " strengths=" +
+                              (0 until 4).joinToString(",") { "%.2f".format(if (cnt[it] > 0) sum[it] / cnt[it] else 0.0) }
+                      )
                       var bar = 0
                       var k = down
                       while (k < beats.size) {
@@ -960,6 +1078,11 @@ jobs:
                       }
                   }
                   ev.sortBy { it.first }
+                  Dbg.log(
+                      "tracker: events=" + ev.size + " kick=" + ev.count { it.third == 0 } + " bar=" + ev.count { it.third == 1 } +
+                          " phrase=" + ev.count { it.third == 2 } + " first at " +
+                          ev.take(6).joinToString(",") { "%.2f".format(SongMap.frameTime(it.first)) } + "s"
+                  )
                   val t = FloatArray(ev.size) { SongMap.frameTime(ev[it].first).toFloat() }
                   val s = ByteArray(ev.size) { (ev[it].second.coerceIn(0f, 1f) * 255f).toInt().toByte() }
                   val kd = ByteArray(ev.size) { ev[it].third.toByte() }
@@ -995,6 +1118,7 @@ jobs:
               /** Decodes any song the phone can play into 44.1 kHz stereo 16-bit. Returns null if cancelled/failed. */
               fun decode(ctx: Context, uri: Uri, cancel: () -> Boolean, progress: (Float) -> Unit): Pcm? {
                   val ex = MediaExtractor()
+                  val t0 = android.os.SystemClock.elapsedRealtime()
                   var codec: MediaCodec? = null
                   try {
                       ex.setDataSource(ctx, uri, null)
@@ -1079,6 +1203,11 @@ jobs:
                                   nf.getInteger(MediaFormat.KEY_PCM_ENCODING) == 4 // AudioFormat.ENCODING_PCM_FLOAT
                           }
                       }
+                      Dbg.log(
+                          "decode: mime=" + mime + " rate=" + sr + " ch=" + ch + " float=" + isFloat +
+                              " samples=" + n + " (" + (n / max(sr, 1)) + "s) took=" +
+                              (android.os.SystemClock.elapsedRealtime() - t0) + "ms"
+                      )
                       if (n < 4096) return null
                       if (sr == SongMap.SR) return Pcm(l, r, n)
 
@@ -1097,6 +1226,7 @@ jobs:
                       }
                       return Pcm(l2, r2, m)
                   } catch (e: Exception) {
+                      Dbg.err("decode failed", e)
                       return null
                   } finally {
                       try { codec?.stop() } catch (e: Exception) { }
@@ -1191,8 +1321,16 @@ jobs:
                   o1.setIntraOpNumThreads(2)
                   val o2 = OrtSession.SessionOptions()
                   o2.setIntraOpNumThreads(2)
-                  drums = e.createSession(modelFile("drums.onnx").absolutePath, o1)
-                  bass = e.createSession(modelFile("bass.onnx").absolutePath, o2)
+                  val t0 = android.os.SystemClock.elapsedRealtime()
+                  val fd = modelFile("drums.onnx")
+                  val fb = modelFile("bass.onnx")
+                  Dbg.log("models copied: drums=" + fd.length() + "B bass=" + fb.length() + "B took=" + (android.os.SystemClock.elapsedRealtime() - t0) + "ms")
+                  val t1 = android.os.SystemClock.elapsedRealtime()
+                  drums = e.createSession(fd.absolutePath, o1)
+                  bass = e.createSession(fb.absolutePath, o2)
+                  Dbg.log("models loaded in " + (android.os.SystemClock.elapsedRealtime() - t1) + "ms")
+                  Dbg.log("drums in=" + drums!!.inputInfo + " out=" + drums!!.outputInfo)
+                  Dbg.log("bass  in=" + bass!!.inputInfo + " out=" + bass!!.outputInfo)
               }
 
               fun close() {
@@ -1206,6 +1344,8 @@ jobs:
               fun analyze(uri: Uri, progress: (Float) -> Unit): SongMap? {
                   cancel = false
                   lastError = ""
+                  val tStart = android.os.SystemClock.elapsedRealtime()
+                  Dbg.log("analyze: start " + uri)
                   try {
                       Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
                       val pcm = Decoder.decode(ctx, uri, { cancel }) { progress(it * 0.08f) }
@@ -1225,6 +1365,9 @@ jobs:
                       val splits = (frames + CHUNK - 1) / CHUNK
                       val kick = FloatArray(frames)
                       val bassE = FloatArray(frames)
+                      val inK = FloatArray(frames)   // same bands measured on the ORIGINAL song (to compare)
+                      val inB = FloatArray(frames)
+                      Dbg.log("analyze: samples=" + n + " frames=" + frames + " splits=" + splits)
 
                       val win = FloatArray(SongMap.WIN) { (0.5 - 0.5 * cos(2.0 * PI * it / SongMap.WIN)).toFloat() }
                       val fft = Fft(SongMap.WIN)
@@ -1263,8 +1406,12 @@ jobs:
                                   val li = (im[k] - im[k2]) * 0.5f
                                   val rr = (im[k] + im[k2]) * 0.5f
                                   val ri = (re[k2] - re[k]) * 0.5f
-                                  buf.put(baseL + k, sqrt(lr * lr + li * li))
-                                  buf.put(baseR + k, sqrt(rr * rr + ri * ri))
+                                  val ml = sqrt(lr * lr + li * li)
+                                  val mr = sqrt(rr * rr + ri * ri)
+                                  buf.put(baseL + k, ml)
+                                  buf.put(baseR + k, mr)
+                                  if (k in KICK_LO..KICK_HI) inK[j] += (ml + mr) * 0.5f
+                                  if (k in BASS_LO..BASS_HI) inB[j] += (ml + mr) * 0.5f
                               }
                           }
                           buf.rewind()
@@ -1301,12 +1448,38 @@ jobs:
                               tensor.close()
                           }
                           progress(0.08f + 0.9f * (s + 1) / splits)
+                          if (s == 0 || s == splits - 1 || s % 5 == 0) {
+                              Dbg.log(
+                                  "analyze: split " + (s + 1) + "/" + splits + " done, elapsed=" +
+                                      (android.os.SystemClock.elapsedRealtime() - tStart) + "ms"
+                              )
+                          }
                       }
+                      fun st(x: FloatArray): String {
+                          var mx = 0f; var sum = 0.0; var nz = 0
+                          for (v in x) { if (v > mx) mx = v; sum += v; if (v > 1e-6f) nz++ }
+                          return "max=%.3f mean=%.4f nonzero=%d/%d".format(mx, sum / x.size, nz, x.size)
+                      }
+                      Dbg.log("stats original kick-band : " + st(inK))
+                      Dbg.log("stats drums-stem kick-band: " + st(kick))
+                      Dbg.log("stats original bass-band : " + st(inB))
+                      Dbg.log("stats bass-stem band     : " + st(bassE))
+                      var sk = 0.0; var si = 0.0; var sbo = 0.0; var sbi = 0.0
+                      for (i in 0 until frames) { sk += kick[i]; si += inK[i]; sbo += bassE[i]; sbi += inB[i] }
+                      Dbg.log(
+                          "ratio stem/original: drums=%.3f bass=%.3f (about 0.1-1.0 is plausible; ~0 means the model got silence / wrong input scale)"
+                              .format(sk / max(si, 1e-9), sbo / max(sbi, 1e-9))
+                      )
                       val map = BeatTracker.build(kick, bassE, frames)
+                      Dbg.log(
+                          "analyze: done in " + (android.os.SystemClock.elapsedRealtime() - tStart) + "ms, bpm=" + map.bpm +
+                              " events=" + map.evT.size
+                      )
                       progress(1f)
                       return map
                   } catch (t: Throwable) {
                       lastError = (t.message ?: t.javaClass.simpleName).take(120)
+                      Dbg.err("analyze failed", t)
                       return null
                   } finally {
                       Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT)
@@ -1475,6 +1648,9 @@ jobs:
               private var lastPos = -1.0
               private var evIdx = 0
               @JvmField var usingMap = false
+              private var evCount = 0
+              private var lastLogT = 0f
+              private var loggedKey = ""
 
               private var cx = 0f
               private var cy = 0f
@@ -1558,8 +1734,31 @@ jobs:
               // ------------------------------------------------------------ beats
               private fun processBeats(now: Long, dt: Float) {
                   val src = source
-                  val m = src?.map()
+                  val mm = src?.map()
+                  val m = if (Cfg.useMap) mm else null
                   usingMap = m != null
+                  if (src != null) {
+                      val k = src.key() + (if (m != null) "|map" else if (mm != null) "|off" else "|live")
+                      if (k != loggedKey) {
+                          loggedKey = k
+                          if (m != null) {
+                              Dbg.log("viz: song " + src.key() + " uses SAVED ANALYSIS (bpm=" + "%.1f".format(m.bpm) + ", events=" + m.evT.size + ")")
+                          } else if (mm != null) {
+                              Dbg.log("viz: song " + src.key() + " has analysis but it is switched OFF, using live detection")
+                          } else {
+                              Dbg.log("viz: song " + src.key() + " has NO analysis yet, using live detection")
+                          }
+                      }
+                  }
+                  if (playing && time - lastLogT >= 10f) {
+                      Dbg.log(
+                          "viz 10s: source=" + (if (usingMap) "analysis" else "live") + " pops=" + evCount +
+                              " bpm=" + (if (usingMap) "%.1f".format(m?.bpm ?: 0f) else "%.1f".format(AudioBus.bpm)) +
+                              " syncMs=" + Cfg.syncMs
+                      )
+                      evCount = 0
+                      lastLogT = time
+                  }
                   if (src != null && m != null) {
                       mapBeats(src, m)
                   } else {
@@ -1626,6 +1825,7 @@ jobs:
               }
 
               private fun fireBeat(str: Float, kind: Int) {
+                  evCount++
                   val mult = when (kind) {
                       1 -> 1.45f
                       2 -> 2.0f
@@ -1883,6 +2083,9 @@ jobs:
           import kotlinx.coroutines.withContext
           import kotlin.math.roundToInt
           import java.io.File
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.ui.text.font.FontFamily
           import java.util.concurrent.ConcurrentHashMap
           import java.util.concurrent.ConcurrentLinkedDeque
           import kotlinx.coroutines.Job
@@ -1900,6 +2103,7 @@ jobs:
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  Dbg.init(applicationContext)
                   enableEdgeToEdge(
                       statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
                       navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
@@ -1915,7 +2119,7 @@ jobs:
           // ---------------------------------------------------------------- data
           data class Track(val id: Long, val title: String, val artist: String, val durMs: Long, val uri: Uri)
 
-          enum class Panel { None, List, Menu, Eq, Viz }
+          enum class Panel { None, List, Menu, Eq, Viz, Log }
 
           fun scanTracks(ctx: Context): List<Track> {
               val list = ArrayList<Track>()
@@ -2014,6 +2218,7 @@ jobs:
                   posMs = c.currentPosition
                   if (nowId != lastEnq) {
                       lastEnq = nowId
+                      Dbg.log("now playing: id=" + nowId + " title=" + title + " hasAnalysis=" + (mapFor(nowId) != null))
                       nowId.toLongOrNull()?.let { enqueue(it, true) }
                   }
               }
@@ -2138,6 +2343,7 @@ jobs:
               fun enqueue(id: Long, front: Boolean) {
                   if (id in skipped || queue.contains(id) || hasMap(id)) return
                   if (front) queue.addFirst(id) else queue.addLast(id)
+                  Dbg.log("queue: added id=" + id + " front=" + front + " waiting=" + queue.size)
                   anaQueued = queue.size
                   startWorker()
               }
@@ -2148,9 +2354,13 @@ jobs:
                   if (queue.isEmpty() && !anaActive) Toast.makeText(app, "All songs are already analyzed", Toast.LENGTH_SHORT).show()
               }
 
-              fun skipCurrent() { analyzer?.cancel = true }
+              fun skipCurrent() {
+                  Dbg.log("user: Skip pressed")
+                  analyzer?.cancel = true
+              }
 
               fun stopAll() {
+                  Dbg.log("user: Stop pressed")
                   queue.clear()
                   anaQueued = 0
                   analyzer?.cancel = true
@@ -2170,11 +2380,14 @@ jobs:
                               anaTitle = tr.title
                               anaProgress = 0f
                               anaActive = true
+                              Dbg.log("worker: analyzing id=" + id + " \"" + tr.title + "\" (" + (tr.durMs / 1000) + "s)")
                               val m = an.analyze(tr.uri) { anaProgress = it }
                               if (m != null) {
                                   SongMap.save(m, mapFile(id))
                                   maps[id] = m
+                                  Dbg.log("worker: saved map id=" + id + " events=" + m.evT.size + " file=" + mapFile(id).length() + "B")
                               } else {
+                                  Dbg.log("worker: no map for id=" + id + " cancelled=" + an.cancel + " error=" + an.lastError)
                                   skipped.add(id)
                                   if (!an.cancel && an.lastError.isNotEmpty()) {
                                       val msg = an.lastError
@@ -2433,11 +2646,15 @@ jobs:
                                   onEq = { panel = Panel.Eq },
                                   onViz = { panel = Panel.Viz },
                                   onAna = { panel = Panel.None; vm.analyzeAll() },
+                                  onLog = { panel = Panel.Log },
                                   onScan = { panel = Panel.None; requestAndScan(true) }
                               )
                           }
                           Overlay(panel == Panel.Viz) {
                               VizPanel(vm)
+                          }
+                          Overlay(panel == Panel.Log) {
+                              LogPanel()
                           }
                           Overlay(panel == Panel.Eq) {
                               EqPanel(vm) { idx -> pendingDelete = idx }
@@ -2556,8 +2773,9 @@ jobs:
 
           // ---------------------------------------------------------------- menu
           @Composable
-          fun MenuPanel(onEq: () -> Unit, onViz: () -> Unit, onAna: () -> Unit, onScan: () -> Unit) {
+          fun MenuPanel(onEq: () -> Unit, onViz: () -> Unit, onAna: () -> Unit, onLog: () -> Unit, onScan: () -> Unit) {
               Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                  MenuRow("Log", "See what the app is doing, copy it", onLog) { IconScan() }
                   MenuRow("Analyze all songs", "Find kicks and beats once per song", onAna) { IconViz() }
                   MenuRow("Equalizer", "Add bands and shape the sound", onEq) { IconEq() }
                   MenuRow("Visualizer", "Bass, motion, beat and particles", onViz) { IconViz() }
@@ -2578,6 +2796,66 @@ jobs:
                   Column(Modifier.padding(start = 14.dp)) {
                       Text(title, color = CText, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                       Text(sub, color = CDim, fontSize = 11.sp)
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- log screen
+          @Composable
+          fun LogPanel() {
+              val ctx = LocalContext.current
+              var text by remember { mutableStateOf("Loading...") }
+              var tick by remember { mutableStateOf(0) }
+              val sc = rememberScrollState()
+              LaunchedEffect(tick) {
+                  text = withContext(Dispatchers.IO) { Dbg.full() }
+                  delay(60)
+                  sc.scrollTo(sc.maxValue)
+              }
+              Column(Modifier.fillMaxSize()) {
+                  Row(
+                      Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 6.dp, bottom = 8.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Column(Modifier.weight(1f)) {
+                          Text("Log", color = CText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                          Text("WHAT THE APP IS DOING", color = CDim, fontSize = 10.sp, letterSpacing = 0.6.sp)
+                      }
+                      Box(
+                          Modifier.height(34.dp).clip(RoundedCornerShape(10.dp)).background(Color(0x14FFFFFF))
+                              .tap { tick++ }.padding(horizontal = 14.dp),
+                          contentAlignment = Alignment.Center
+                      ) { Text("Refresh", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                      Box(Modifier.width(8.dp))
+                      Box(
+                          Modifier.height(34.dp).clip(RoundedCornerShape(10.dp))
+                              .background(Brush.linearGradient(listOf(Color(0xFFF7F7FA), Color(0xFFC9C9D2))))
+                              .tap {
+                                  try {
+                                      val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                      cm.setPrimaryClip(android.content.ClipData.newPlainText("GreyPulse log", text))
+                                      Toast.makeText(ctx, "Log copied", Toast.LENGTH_SHORT).show()
+                                  } catch (e: Exception) {
+                                      Toast.makeText(ctx, "Could not copy", Toast.LENGTH_SHORT).show()
+                                  }
+                              }
+                              .padding(horizontal = 16.dp),
+                          contentAlignment = Alignment.Center
+                      ) { Text("Copy", color = Color(0xFF0E0E10), fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                  }
+                  Box(
+                      Modifier
+                          .weight(1f)
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(12.dp))
+                          .background(Color(0x33000000))
+                          .verticalScroll(sc)
+                          .padding(8.dp)
+                  ) {
+                      Text(
+                          text, color = Color(0xCCFFFFFF), fontSize = 9.sp, lineHeight = 12.sp,
+                          fontFamily = FontFamily.Monospace
+                      )
                   }
               }
           }
@@ -2691,6 +2969,16 @@ jobs:
                           }
 
                           SectionTitle("Beat", "Center pops bigger, particles scatter away")
+                          Row(
+                              Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
+                              Column(Modifier.weight(1f)) {
+                                  Text("Use saved analysis", color = Color(0xCCFFFFFF), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                  Text("Off = always use live detection (to compare)", color = CDim, fontSize = 10.sp)
+                              }
+                              Toggle(Cfg.useMap) { Cfg.useMap = it; changed() }
+                          }
                           SliderRow("Detection sensitivity", "%.2fx".format(Cfg.beatSens), lin(Cfg.beatSens, 0.3f, 3f)) {
                               Cfg.beatSens = unlin(it, 0.3f, 3f); changed()
                           }
