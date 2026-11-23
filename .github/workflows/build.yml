@@ -264,7 +264,8 @@ jobs:
               @Volatile var beatSens = 1f
               @Volatile var popStrength = 1f     // how big the center gets on a beat
               @Volatile var scatter = 1f         // how far particles are kicked on a beat
-              @Volatile var syncMs = 120         // visuals delay to match the speaker
+              @Volatile var syncMs = 0           // live-detector delay (0 = fire the moment the audio is seen)
+              @Volatile var mapSyncMs = 0        // trim for saved-analysis timing (+ earlier, - later)
               @Volatile var pSize = 1f
               @Volatile var pCount = 160
               @Volatile var pRumble = 1f
@@ -275,7 +276,7 @@ jobs:
                   useMap = true
                   bassLo = 16; bassHi = 60; bassSens = 1f
                   midLo = 1000; midHi = 4000; midSens = 1f; midMove = 1f
-                  beatSens = 1f; popStrength = 1f; scatter = 1f; syncMs = 120
+                  beatSens = 1f; popStrength = 1f; scatter = 1f; syncMs = 0; mapSyncMs = 0
                   pSize = 1f; pCount = 160; pRumble = 1f
               }
 
@@ -290,7 +291,8 @@ jobs:
                   beatSens = p.getFloat("c_beatSens", 1f)
                   popStrength = p.getFloat("c_pop", 1f)
                   scatter = p.getFloat("c_scatter", 1f)
-                  syncMs = p.getInt("c_sync", 120)
+                  syncMs = p.getInt("c_sync2", 0)
+                  mapSyncMs = p.getInt("c_mapTrim", 0)
                   pSize = p.getFloat("c_pSize", 1f)
                   pCount = p.getInt("c_pCount", 160)
                   pRumble = p.getFloat("c_pRumble", 1f)
@@ -305,7 +307,7 @@ jobs:
                       .putInt("c_bassLo", bassLo).putInt("c_bassHi", bassHi).putFloat("c_bassSens", bassSens)
                       .putInt("c_midLo", midLo).putInt("c_midHi", midHi).putFloat("c_midSens", midSens)
                       .putFloat("c_midMove", midMove).putFloat("c_beatSens", beatSens)
-                      .putFloat("c_pop", popStrength).putFloat("c_scatter", scatter).putInt("c_sync", syncMs)
+                      .putFloat("c_pop", popStrength).putFloat("c_scatter", scatter).putInt("c_sync2", syncMs).putInt("c_mapTrim", mapSyncMs)
                       .putFloat("c_pSize", pSize).putInt("c_pCount", pCount).putFloat("c_pRumble", pRumble)
                       .putBoolean("c_useMap", useMap)
                       .apply()
@@ -857,7 +859,7 @@ jobs:
                   const val HOP = 1024
                   const val WIN = 4096
                   const val FPS = SR.toDouble() / HOP
-                  private const val MAGIC = 0x47504D31 // GPM1
+                  private const val MAGIC = 0x47504D32 // GPM2 (v2: kick times refined on the song's own bass; old files are re-analyzed)
 
                   fun frameTime(j: Int): Double = (j.toLong() * HOP + WIN / 2).toDouble() / SR
 
@@ -1087,6 +1089,90 @@ jobs:
                   val s = ByteArray(ev.size) { (ev[it].second.coerceIn(0f, 1f) * 255f).toInt().toByte() }
                   val kd = ByteArray(ev.size) { ev[it].third.toByte() }
                   return SongMap(bpm, kb, bb, t, s, kd)
+              }
+          }
+
+          /**
+           * The stem analysis only knows each kick to within one 93 ms window. This moves every event to the
+           * exact moment of the kick, measured on the song's own low band (below ~120 Hz, 1 ms resolution):
+           * the steepest rise of bass power within a short window around the stem's estimate.
+           */
+          object Refiner {
+              fun refine(m: SongMap, pcm: Pcm): SongMap {
+                  val ms = pcm.n / 44
+                  if (ms < 400 || m.evT.isEmpty()) return m
+
+                  // 1 ms bass power
+                  val pw = FloatArray(ms)
+                  val a = (1.0 - Math.exp(-2.0 * Math.PI * 120.0 / SongMap.SR)).toFloat()
+                  var y1 = 0f
+                  var y2 = 0f
+                  var acc = 0f
+                  var cnt = 0
+                  var bi = 0
+                  val inv = 1f / 32768f
+                  for (i in 0 until ms * 44) {
+                      val x = (pcm.l[i] + pcm.r[i]) * 0.5f * inv
+                      y1 += a * (x - y1)
+                      y2 += a * (y1 - y2)
+                      acc += y2 * y2
+                      cnt++
+                      if (cnt == 44) { pw[bi++] = acc / 44f; acc = 0f; cnt = 0 }
+                  }
+                  // 10 ms box smoothing (removes the ripple of 50-100 Hz waves), then slope over 4 ms
+                  val cs = DoubleArray(ms + 1)
+                  for (i in 0 until ms) cs[i + 1] = cs[i] + pw[i]
+                  val sm = FloatArray(ms)
+                  for (i in 5 until ms - 5) sm[i] = ((cs[i + 5] - cs[i - 5]) / 10.0).toFloat()
+                  val d = FloatArray(ms)
+                  for (i in 2 until ms - 2) d[i] = sm[i + 2] - sm[i - 2]
+
+                  val n = m.evT.size
+                  val nt = DoubleArray(n)
+                  val shifts = ArrayList<Int>()
+                  for (e in 0 until n) {
+                      val c = (m.evT[e].toDouble() * SongMap.SR / 44.0).toInt() // blocks of 44 samples
+                      val lo = max(8, c - 90)
+                      val hi = min(ms - 9, c + 30)
+                      var best = -1
+                      var bv = 1e-9f
+                      for (i in lo..hi) if (d[i] > bv) { bv = d[i]; best = i }
+                      if (best >= 0) {
+                          nt[e] = best * 44.0 / SongMap.SR
+                          shifts.add(best - c)
+                      } else {
+                          nt[e] = m.evT[e].toDouble()
+                      }
+                  }
+                  // sort by new time, merge hits closer than 35 ms
+                  val order = (0 until n).sortedBy { nt[it] }
+                  val tt = ArrayList<Double>()
+                  val ss = ArrayList<Int>()
+                  val kk = ArrayList<Int>()
+                  for (e in order) {
+                      val s = m.evS[e].toInt() and 255
+                      val k = m.evK[e].toInt()
+                      if (tt.isNotEmpty() && nt[e] - tt[tt.size - 1] < 0.035) {
+                          val L = tt.size - 1
+                          if (s > ss[L]) { ss[L] = s; tt[L] = nt[e] }
+                          if (k > kk[L]) kk[L] = k
+                      } else {
+                          tt.add(nt[e]); ss.add(s); kk.add(k)
+                      }
+                  }
+                  if (shifts.isNotEmpty()) {
+                      shifts.sort()
+                      Dbg.log(
+                          "refine: moved " + shifts.size + "/" + n + " events, median shift=" + shifts[shifts.size / 2] +
+                              "ms (p10=" + shifts[shifts.size / 10] + " p90=" + shifts[shifts.size * 9 / 10] + "), merged to " + tt.size
+                      )
+                  }
+                  return SongMap(
+                      m.bpm, m.kickEnv, m.bassEnv,
+                      FloatArray(tt.size) { tt[it].toFloat() },
+                      ByteArray(tt.size) { ss[it].toByte() },
+                      ByteArray(tt.size) { kk[it].toByte() }
+                  )
               }
           }
           KOTLIN_EOF
@@ -1470,7 +1556,8 @@ jobs:
                           "ratio stem/original: drums=%.3f bass=%.3f (about 0.1-1.0 is plausible; ~0 means the model got silence / wrong input scale)"
                               .format(sk / max(si, 1e-9), sbo / max(sbi, 1e-9))
                       )
-                      val map = BeatTracker.build(kick, bassE, frames)
+                      val map0 = BeatTracker.build(kick, bassE, frames)
+                      val map = Refiner.refine(map0, pcm)
                       Dbg.log(
                           "analyze: done in " + (android.os.SystemClock.elapsedRealtime() - tStart) + "ms, bpm=" + map.bpm +
                               " events=" + map.evT.size
@@ -1511,6 +1598,11 @@ jobs:
 
               private var session: MediaSession? = null
 
+              companion object {
+                  /** The real player (same process as the UI), so the visualizer can read its exact position. */
+                  @Volatile var player: ExoPlayer? = null
+              }
+
               override fun onCreate() {
                   super.onCreate()
                   val factory = object : DefaultRenderersFactory(this) {
@@ -1535,6 +1627,7 @@ jobs:
                       .setWakeMode(C.WAKE_MODE_LOCAL)
                       .build()
                   player.repeatMode = Player.REPEAT_MODE_ALL
+                  PlaybackService.player = player
                   session = MediaSession.Builder(this, player).build()
               }
 
@@ -1546,6 +1639,7 @@ jobs:
               }
 
               override fun onDestroy() {
+                  PlaybackService.player = null
                   session?.run {
                       player.release()
                       release()
@@ -1564,6 +1658,7 @@ jobs:
           import android.graphics.Color
           import android.graphics.Paint
           import android.view.View
+          import kotlin.math.abs
           import kotlin.math.cos
           import kotlin.math.exp
           import kotlin.math.floor
@@ -1754,13 +1849,14 @@ jobs:
                       Dbg.log(
                           "viz 10s: source=" + (if (usingMap) "analysis" else "live") + " pops=" + evCount +
                               " bpm=" + (if (usingMap) "%.1f".format(m?.bpm ?: 0f) else "%.1f".format(AudioBus.bpm)) +
-                              " syncMs=" + Cfg.syncMs
+                              " syncMs=" + Cfg.syncMs + " trim=" + Cfg.mapSyncMs +
+                              (if (usingMap) " lead=" + (lead * 1000).toInt() + "ms(n=" + leadN + ")" else "")
                       )
                       evCount = 0
                       lastLogT = time
                   }
                   if (src != null && m != null) {
-                      mapBeats(src, m)
+                      mapBeats(src, m, now)
                   } else {
                       liveBeats(now)
                       kickBody *= exp(-dt * 8f)
@@ -1769,15 +1865,56 @@ jobs:
                   pop *= exp(-dt * 6.5f)
               }
 
-              private fun mapBeats(src: VizSource, m: SongMap) {
+              // How far ahead of the player position the live detector sees the audio (seconds). It is measured
+              // by matching live detections with saved kick times, so the saved events fire with the same timing
+              // the live detector has (which you found to feel right), on any speaker or Bluetooth device.
+              private var lead = 0.15
+              private val leadSamples = DoubleArray(24)
+              private var leadN = 0
+              private var leadI = 0
+
+              private fun calibrate(m: SongMap, rawPos: Double, now: Long) {
+                  val headNow = AudioBus.beatHead
+                  if (headNow == lastSeen) return
+                  var i = max(lastSeen, headNow - AudioBus.QN)
+                  while (i < headNow) {
+                      val k = i % AudioBus.QN
+                      val age = (now - AudioBus.beatNs[k]) / 1e9
+                      if (playing && age >= 0.0 && age <= 0.5 && AudioBus.beatStr[k] >= 0.5f) {
+                          val posAt = rawPos - age
+                          var q = m.firstAfter(posAt + lead - 0.12)
+                          var bd = 9.0
+                          var best = -1.0
+                          while (q < m.evT.size && m.evT[q] <= posAt + lead + 0.12) {
+                              val d = abs(m.evT[q] - (posAt + lead))
+                              if (d < bd) { bd = d; best = m.evT[q] - posAt }
+                              q++
+                          }
+                          if (best > 0.0 && best < 0.5) {
+                              leadSamples[leadI] = best
+                              leadI = (leadI + 1) % leadSamples.size
+                              if (leadN < leadSamples.size) leadN++
+                          }
+                      }
+                      i++
+                  }
+                  lastSeen = headNow
+                  if (leadN >= 6) {
+                      val tmp = leadSamples.copyOf(leadN)
+                      tmp.sort()
+                      lead += (tmp[leadN / 2] - lead) * 0.15
+                  }
+              }
+
+              private fun mapBeats(src: VizSource, m: SongMap, now: Long) {
                   val key = src.key()
                   if (m !== curMap || key != curKey) {
                       curMap = m; curKey = key; lastPos = -1.0
                   }
-                  // keep the live queue empty so it doesn't fire later
-                  lastSeen = AudioBus.beatHead
                   pendN = 0
-                  val pos = src.posSec() - Cfg.syncMs / 1000.0
+                  val rawPos = src.posSec()
+                  calibrate(m, rawPos, now)
+                  val pos = rawPos + lead + Cfg.mapSyncMs / 1000.0
                   kickBody = m.envAt(m.kickEnv, pos)
                   bassBody = m.envAt(m.bassEnv, pos)
                   if (!playing) { lastPos = -1.0; return } // resync on resume / after a seek while paused
@@ -1826,12 +1963,13 @@ jobs:
 
               private fun fireBeat(str: Float, kind: Int) {
                   evCount++
+                  // kicks: weak hits count much less (squared); bar / phrase marks are gentler than before
                   val mult = when (kind) {
-                      1 -> 1.45f
-                      2 -> 2.0f
+                      1 -> 1.2f
+                      2 -> 1.5f
                       else -> 1f
                   }
-                  val v = str * mult
+                  val v = (if (kind == 0) str * str else str) * mult
                   if (v > pop) pop = v
                   pendingScatter += v * Cfg.scatter * (if (kind == 0) 0.7f else 1f)
               }
@@ -2619,7 +2757,8 @@ jobs:
               ) {
                   val vizSource = remember {
                       object : VizSource {
-                          override fun posSec(): Double = (vm.controller?.currentPosition ?: 0L) / 1000.0
+                          override fun posSec(): Double =
+                              (PlaybackService.player?.currentPosition ?: vm.controller?.currentPosition ?: 0L) / 1000.0
                           override fun map(): SongMap? = vm.mapFor(vm.nowId)
                           override fun key(): String = vm.nowId
                       }
@@ -2988,8 +3127,14 @@ jobs:
                           SliderRow("Scatter strength", "%.2fx".format(Cfg.scatter), lin(Cfg.scatter, 0f, 3f)) {
                               Cfg.scatter = unlin(it, 0f, 3f); changed()
                           }
-                          SliderRow("Sync offset", Cfg.syncMs.toString() + " ms", lin(Cfg.syncMs.toFloat(), 0f, 400f)) {
+                          SliderRow("Live sync delay", Cfg.syncMs.toString() + " ms", lin(Cfg.syncMs.toFloat(), 0f, 400f)) {
                               Cfg.syncMs = unlin(it, 0f, 400f).roundToInt(); changed()
+                          }
+                          SliderRow(
+                              "Analysis timing trim", (if (Cfg.mapSyncMs > 0) "+" else "") + Cfg.mapSyncMs + " ms (+ earlier)",
+                              lin(Cfg.mapSyncMs.toFloat(), -200f, 200f)
+                          ) {
+                              Cfg.mapSyncMs = unlin(it, -200f, 200f).roundToInt(); changed()
                           }
 
                           SectionTitle("Particles", "")
