@@ -2179,4 +2179,191 @@ jobs:
                       horizontalAlignment = Alignment.CenterHorizontally
                   ) {
                       Box(
-                   
+                          Modifier.size(52.dp).clip(CircleShape).background(Color(0x22FF6B81)),
+                          contentAlignment = Alignment.Center
+                      ) { IconTrash() }
+                      Box(Modifier.height(14.dp))
+                      Text("Delete band?", color = CText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                      Box(Modifier.height(6.dp))
+                      Text(
+                          "Remove the " + freq + " Hz band from your equalizer?",
+                          color = CDim, fontSize = 13.sp, textAlign = TextAlign.Center, lineHeight = 19.sp
+                      )
+                      Box(Modifier.height(18.dp))
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                          Box(
+                              Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(12.dp))
+                                  .background(Color(0x14FFFFFF)).tap(onCancel),
+                              contentAlignment = Alignment.Center
+                          ) { Text("Cancel", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+                          Box(
+                              Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(12.dp))
+                                  .background(CHeart).tap(onDelete),
+                              contentAlignment = Alignment.Center
+                          ) { Text("Delete", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+                      }
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- bottom controls
+          @Composable
+          fun Controls(vm: PlayerVm) {
+              Column(
+                  Modifier
+                      .fillMaxWidth()
+                      .navigationBarsPadding()
+                      .padding(start = 22.dp, end = 22.dp, bottom = 24.dp)
+              ) {
+                  Column(Modifier.fillMaxWidth().padding(bottom = 20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                      Text(
+                          vm.title, color = CText, fontSize = 20.sp, fontWeight = FontWeight.Bold,
+                          maxLines = 1, overflow = TextOverflow.Ellipsis
+                      )
+                      Text(vm.artist, color = CDim, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  }
+                  SeekBar(vm)
+                  Box(Modifier.height(22.dp))
+                  Row(
+                      Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.spacedBy(28.dp, Alignment.CenterHorizontally),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Box(Modifier.size(44.dp).tap { vm.prev() }, contentAlignment = Alignment.Center) { IconPrev() }
+                      Box(
+                          Modifier
+                              .size(68.dp)
+                              .clip(CircleShape)
+                              .background(Brush.linearGradient(listOf(Color(0xFFF7F7FA), Color(0xFFC9C9D2))))
+                              .tap { vm.togglePlay() },
+                          contentAlignment = Alignment.Center
+                      ) {
+                          if (vm.isPlaying) IconPause(Color(0xFF0E0E10), 30.dp) else IconPlay(Color(0xFF0E0E10), 30.dp)
+                      }
+                      Box(Modifier.size(44.dp).tap { vm.next() }, contentAlignment = Alignment.Center) { IconNext() }
+                  }
+              }
+          }
+
+          @Composable
+          fun SeekBar(vm: PlayerVm) {
+              var drag by remember { mutableStateOf<Float?>(null) }
+              var wPx by remember { mutableStateOf(1f) }
+              val d = drag
+              val frac = d ?: if (vm.durMs > 0) (vm.posMs.toFloat() / vm.durMs).coerceIn(0f, 1f) else 0f
+              Column(Modifier.fillMaxWidth()) {
+                  Box(
+                      Modifier
+                          .fillMaxWidth()
+                          .height(28.dp)
+                          .onSizeChanged { wPx = it.width.toFloat().coerceAtLeast(1f) }
+                          .pointerInput(Unit) {
+                              detectTapGestures { o -> vm.seekFrac((o.x / wPx).coerceIn(0f, 1f)) }
+                          }
+                          .pointerInput(Unit) {
+                              detectHorizontalDragGestures(
+                                  onDragStart = { o -> drag = (o.x / wPx).coerceIn(0f, 1f) },
+                                  onDragEnd = {
+                                      val v = drag
+                                      if (v != null) vm.seekFrac(v)
+                                      drag = null
+                                  },
+                                  onDragCancel = { drag = null },
+                                  onHorizontalDrag = { ch, _ -> drag = (ch.position.x / wPx).coerceIn(0f, 1f) }
+                              )
+                          },
+                      contentAlignment = Alignment.CenterStart
+                  ) {
+                      Box(Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(99.dp)).background(CSurf3))
+                      Box(
+                          Modifier.fillMaxWidth(frac).height(6.dp).clip(RoundedCornerShape(99.dp))
+                              .background(Brush.horizontalGradient(listOf(Color(0xFFF5F5F7), Color(0xFFB8B8C2))))
+                      )
+                      Box(
+                          Modifier
+                              .offset { IntOffset((frac * wPx - 7.dp.toPx()).roundToInt(), 0) }
+                              .size(14.dp)
+                              .clip(CircleShape)
+                              .background(Color.White)
+                      )
+                  }
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                      Text(fmtMs((frac * vm.durMs).toLong()), color = CDim, fontSize = 11.sp)
+                      Text(fmtMs(vm.durMs), color = CDim, fontSize = 11.sp)
+                  }
+              }
+          }
+          KOTLIN_EOF
+
+      - name: Generate dummy keystore
+        run: |
+          keytool -genkeypair -v -keystore app/dummy.keystore -alias dummy \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass password -keypass password \
+            -dname "CN=GreyPulse, OU=Dev, O=Grey, L=NA, S=NA, C=US"
+
+      - name: Generate launcher icons
+        run: |
+          python3 -c "import PIL" 2>/dev/null || pip install --quiet --break-system-packages pillow
+          python3 - << 'PY'
+          from PIL import Image, ImageDraw
+          import os
+
+          sizes = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+
+          def make(sz, rnd):
+              S = sz * 4
+              im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+              d = ImageDraw.Draw(im)
+              bg = (24, 24, 27, 255)
+              if rnd:
+                  d.ellipse((0, 0, S - 1, S - 1), fill=bg)
+              else:
+                  d.rounded_rectangle((0, 0, S - 1, S - 1), radius=int(S * 0.22), fill=bg)
+              c = S / 2
+              for r, col in ((0.40, (235, 235, 240, 255)), (0.32, (0, 0, 0, 255)),
+                             (0.24, (235, 235, 240, 255)), (0.15, (0, 0, 0, 255))):
+                  d.ellipse((c - r * S, c - r * S, c + r * S, c + r * S), fill=col)
+              return im.resize((sz, sz), Image.LANCZOS)
+
+          for name, sz in sizes.items():
+              folder = "app/src/main/res/mipmap-" + name
+              os.makedirs(folder, exist_ok=True)
+              make(sz, False).save(folder + "/ic_launcher.png")
+              make(sz, True).save(folder + "/ic_launcher_round.png")
+          PY
+
+      - name: Gradle wrapper
+        run: gradle wrapper --gradle-version 8.11.1 --no-daemon
+
+      - name: Build release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew clean assembleRelease --no-daemon
+
+      - name: Verify APK signature
+        run: |
+          APK=app/build/outputs/apk/release/app-arm64-v8a-release.apk
+          ls -la app/build/outputs/apk/release/
+          BT=$(ls -d /usr/local/lib/android/sdk/build-tools/* | sort -V | tail -1)
+          "$BT/apksigner" verify --verbose "$APK"
+
+      - name: Bundle output
+        run: |
+          mkdir -p bundle
+          cp app/build/outputs/apk/release/app-arm64-v8a-release.apk bundle/GreyPulse.apk
+          cp -r app/src bundle/source
+          cp .github/workflows/build.yml bundle/build.yml
+          {
+            echo "App: GreyPulse (com.grey.pulse)"
+            echo "Build number: ${BUILD_NUMBER}"
+            echo "Commit: ${GITHUB_SHA}"
+            echo "Built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > bundle/BUILD_INFO.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GreyPulse-${{ github.run_number }}
+          path: bundle
+          retention-days: 30
