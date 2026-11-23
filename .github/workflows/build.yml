@@ -1,0 +1,1769 @@
+name: Build GreyPulse
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      BUILD_NUMBER: ${{ github.run_number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Write local.properties
+        run: echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-greypulse-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: gradle-greypulse-
+
+      - name: Generate project structure
+        run: |
+          mkdir -p app/src/main/java/com/grey/pulse
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle.kts << 'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "GreyPulse"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application") version "8.9.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.2.0" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.2.0" apply false
+          }
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.suppressUnsupportedCompileSdk=36
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle.kts << 'EOF'
+          import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          val buildNum = (System.getenv("BUILD_NUMBER") ?: "1").toInt()
+
+          android {
+              namespace = "com.grey.pulse"
+              compileSdk = 36
+
+              defaultConfig {
+                  applicationId = "com.grey.pulse"
+                  minSdk = 26
+                  targetSdk = 36
+                  versionCode = buildNum
+                  versionName = buildNum.toString()
+              }
+
+              signingConfigs {
+                  create("dummy") {
+                      storeFile = file("dummy.keystore")
+                      storePassword = "password"
+                      keyAlias = "dummy"
+                      keyPassword = "password"
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      isShrinkResources = false
+                      isDebuggable = false
+                      signingConfig = signingConfigs.getByName("dummy")
+                  }
+              }
+
+              splits {
+                  abi {
+                      isEnable = true
+                      reset()
+                      include("arm64-v8a")
+                      isUniversalApk = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+              }
+
+              packaging {
+                  resources {
+                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                  }
+              }
+          }
+
+          kotlin {
+              compilerOptions {
+                  jvmTarget.set(JvmTarget.JVM_17)
+              }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2025.05.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.10.1")
+              implementation("androidx.core:core-ktx:1.16.0")
+              implementation("androidx.media3:media3-common:1.8.0")
+              implementation("androidx.media3:media3-exoplayer:1.8.0")
+              implementation("androidx.media3:media3-session:1.8.0")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:label="GreyPulse"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:screenOrientation="portrait"
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|smallestScreenSize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".PlaybackService"
+                      android:exported="true"
+                      android:foregroundServiceType="mediaPlayback">
+                      <intent-filter>
+                          <action android:name="androidx.media3.session.MediaSessionService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/styles.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">#FF0E0E10</item>
+                  <item name="android:statusBarColor">#00000000</item>
+                  <item name="android:navigationBarColor">#00000000</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">GreyPulse</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/java/com/grey/pulse/Audio.kt << 'KOTLIN_EOF'
+          package com.grey.pulse
+
+          import androidx.annotation.OptIn
+          import androidx.media3.common.C
+          import androidx.media3.common.audio.AudioProcessor
+          import androidx.media3.common.audio.BaseAudioProcessor
+          import androidx.media3.common.util.UnstableApi
+          import java.nio.ByteBuffer
+          import kotlin.math.PI
+          import kotlin.math.cos
+          import kotlin.math.log10
+          import kotlin.math.max
+          import kotlin.math.pow
+          import kotlin.math.sin
+          import kotlin.math.sqrt
+
+          data class EqBand(val freq: Int, val gain: Int)
+
+          /**
+           * Shared in-process bridge between the audio thread (BusProcessor) and the UI.
+           * levels[] = 12 bass bands from FREQ_MIN to FREQ_MAX Hz, each 0..1.
+           */
+          object AudioBus {
+              // The visualizer only listens to this range (as requested: 16 Hz - 60 Hz).
+              const val FREQ_MIN = 16
+              const val FREQ_MAX = 60
+              const val BANDS = 12 // 16,20,24,...,60 Hz (4 Hz steps)
+
+              @JvmField val levels = FloatArray(BANDS)
+              @Volatile var lastUpdateNs = 0L
+
+              @Volatile var eqOn = false
+              @Volatile var eqBands: List<EqBand> = emptyList()
+              @Volatile var eqVersion = 0
+
+              fun setEq(on: Boolean, bands: List<EqBand>) {
+                  eqOn = on
+                  eqBands = bands
+                  eqVersion++
+              }
+          }
+
+          /**
+           * Sits in ExoPlayer's audio chain (16-bit PCM only):
+           *  1) user EQ: one peaking biquad per band (gain -50..0 dB)
+           *  2) bass analysis: low-pass + decimate, then Goertzel at 16..60 Hz -> AudioBus.levels
+           * Analysis is done AFTER the EQ, so the visualizer shows what you actually hear.
+           * No microphone / RECORD_AUDIO permission needed.
+           */
+          @OptIn(UnstableApi::class)
+          class BusProcessor : BaseAudioProcessor() {
+
+              companion object {
+                  private const val N = 256          // Goertzel window (decimated samples)
+                  private const val HOP = 32         // new analysis every 32 decimated samples
+                  private const val EQ_Q = 1.0
+                  private val FREQS = DoubleArray(AudioBus.BANDS) {
+                      AudioBus.FREQ_MIN + it * (AudioBus.FREQ_MAX - AudioBus.FREQ_MIN) / (AudioBus.BANDS - 1.0)
+                  }
+                  private val WIN = FloatArray(N) { (0.5 - 0.5 * cos(2.0 * PI * it / (N - 1))).toFloat() }
+              }
+
+              private var sr = 44100
+              private var ch = 2
+
+              // EQ state (audio thread only)
+              private var eqVersionApplied = -1
+              private var eqWasOn = false
+              private var nBands = 0
+              private var coef = DoubleArray(0) // 5 per band: b0 b1 b2 a1 a2
+              private var st = DoubleArray(0)   // 4 per band per channel: x1 x2 y1 y2
+
+              // analysis state
+              private var dec = 32
+              private var decCount = 0
+              private var lpA = 0.0
+              private var lp1 = 0.0
+              private var lp2 = 0.0
+              private val ring = FloatArray(N)
+              private var ringPos = 0
+              private var hopCount = 0
+              private val gk = DoubleArray(AudioBus.BANDS)
+
+              override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
+                  if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT ||
+                      inputAudioFormat.channelCount < 1 || inputAudioFormat.channelCount > 8
+                  ) {
+                      // not supported: stay inactive, audio still plays normally
+                      return AudioProcessor.AudioFormat.NOT_SET
+                  }
+                  sr = inputAudioFormat.sampleRate
+                  ch = inputAudioFormat.channelCount
+                  dec = max(1, sr / 1400)
+                  val fsD = sr.toDouble() / dec
+                  for (i in 0 until AudioBus.BANDS) gk[i] = 2.0 * cos(2.0 * PI * FREQS[i] / fsD)
+                  lpA = 1.0 - Math.exp(-2.0 * PI * 200.0 / sr)
+                  lp1 = 0.0; lp2 = 0.0; decCount = 0; hopCount = 0; ringPos = 0
+                  java.util.Arrays.fill(ring, 0f)
+                  eqVersionApplied = -1
+                  nBands = 0
+                  st = DoubleArray(0)
+                  return inputAudioFormat
+              }
+
+              override fun queueInput(inputBuffer: ByteBuffer) {
+                  val n = inputBuffer.remaining()
+                  if (n == 0) return
+                  val out = replaceOutputBuffer(n)
+                  syncEq()
+                  val on = AudioBus.eqOn && nBands > 0
+                  if (on && !eqWasOn) java.util.Arrays.fill(st, 0.0)
+                  eqWasOn = on
+                  val frames = n / (2 * ch)
+                  for (f in 0 until frames) {
+                      var mono = 0.0
+                      for (c in 0 until ch) {
+                          var x = inputBuffer.getShort().toDouble() / 32768.0
+                          if (on) {
+                              for (b in 0 until nBands) {
+                                  val ci = b * 5
+                                  val si = (b * ch + c) * 4
+                                  val y = coef[ci] * x + coef[ci + 1] * st[si] + coef[ci + 2] * st[si + 1] -
+                                      coef[ci + 3] * st[si + 2] - coef[ci + 4] * st[si + 3]
+                                  st[si + 1] = st[si]; st[si] = x
+                                  st[si + 3] = st[si + 2]; st[si + 2] = y
+                                  x = y
+                              }
+                          }
+                          val v = Math.round(x * 32768.0).coerceIn(-32768L, 32767L).toInt()
+                          out.putShort(v.toShort())
+                          mono += x
+                      }
+                      analyze(mono / ch)
+                  }
+                  while (inputBuffer.hasRemaining()) out.put(inputBuffer.get())
+                  out.flip()
+              }
+
+              private fun syncEq() {
+                  val v = AudioBus.eqVersion
+                  if (v == eqVersionApplied) return
+                  eqVersionApplied = v
+                  val bands = AudioBus.eqBands
+                  val newN = bands.size
+                  if (newN != nBands || st.size != newN * ch * 4) st = DoubleArray(newN * ch * 4)
+                  nBands = newN
+                  coef = DoubleArray(newN * 5)
+                  for (i in bands.indices) {
+                      val b = bands[i]
+                      val ci = i * 5
+                      if (b.gain >= 0 || b.freq >= sr * 0.45) {
+                          coef[ci] = 1.0 // identity
+                          continue
+                      }
+                      val a = 10.0.pow(b.gain / 40.0)
+                      val w0 = 2.0 * PI * b.freq / sr
+                      val alpha = sin(w0) / (2.0 * EQ_Q)
+                      val cw = cos(w0)
+                      val a0 = 1.0 + alpha / a
+                      coef[ci] = (1.0 + alpha * a) / a0
+                      coef[ci + 1] = (-2.0 * cw) / a0
+                      coef[ci + 2] = (1.0 - alpha * a) / a0
+                      coef[ci + 3] = (-2.0 * cw) / a0
+                      coef[ci + 4] = (1.0 - alpha / a) / a0
+                  }
+              }
+
+              private fun analyze(x: Double) {
+                  lp1 += lpA * (x - lp1)
+                  lp2 += lpA * (lp1 - lp2)
+                  decCount++
+                  if (decCount < dec) return
+                  decCount = 0
+                  ring[ringPos] = lp2.toFloat()
+                  ringPos = (ringPos + 1) % N
+                  hopCount++
+                  if (hopCount < HOP) return
+                  hopCount = 0
+
+                  val lv = AudioBus.levels
+                  for (i in 0 until AudioBus.BANDS) {
+                      val k = gk[i]
+                      var s1 = 0.0
+                      var s2 = 0.0
+                      var p = ringPos // oldest sample first
+                      for (j in 0 until N) {
+                          val s0 = ring[p].toDouble() * WIN[j].toDouble() + k * s1 - s2
+                          s2 = s1
+                          s1 = s0
+                          p++
+                          if (p == N) p = 0
+                      }
+                      val power = s1 * s1 + s2 * s2 - k * s1 * s2
+                      val amp = sqrt(max(power, 0.0)) / (N / 4.0)
+                      val db = 20.0 * log10(amp + 1e-9)
+                      lv[i] = ((db + 60.0) / 57.0).coerceIn(0.0, 1.0).toFloat()
+                  }
+                  AudioBus.lastUpdateNs = System.nanoTime()
+              }
+          }
+          KOTLIN_EOF
+
+          cat > app/src/main/java/com/grey/pulse/PlaybackService.kt << 'KOTLIN_EOF'
+          package com.grey.pulse
+
+          import android.content.Context
+          import android.content.Intent
+          import androidx.annotation.OptIn
+          import androidx.media3.common.AudioAttributes
+          import androidx.media3.common.C
+          import androidx.media3.common.Player
+          import androidx.media3.common.audio.AudioProcessor
+          import androidx.media3.common.util.UnstableApi
+          import androidx.media3.exoplayer.DefaultRenderersFactory
+          import androidx.media3.exoplayer.ExoPlayer
+          import androidx.media3.exoplayer.audio.AudioSink
+          import androidx.media3.exoplayer.audio.DefaultAudioSink
+          import androidx.media3.session.MediaSession
+          import androidx.media3.session.MediaSessionService
+
+          @OptIn(UnstableApi::class)
+          class PlaybackService : MediaSessionService() {
+
+              private var session: MediaSession? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  val factory = object : DefaultRenderersFactory(this) {
+                      override fun buildAudioSink(
+                          context: Context,
+                          enableFloatOutput: Boolean,
+                          enableAudioTrackPlaybackParams: Boolean
+                      ): AudioSink {
+                          // our processor goes first: EQ + 16-60 Hz analysis
+                          return DefaultAudioSink.Builder(context)
+                              .setAudioProcessors(arrayOf<AudioProcessor>(BusProcessor()))
+                              .build()
+                      }
+                  }
+                  val attrs = AudioAttributes.Builder()
+                      .setUsage(C.USAGE_MEDIA)
+                      .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                      .build()
+                  val player = ExoPlayer.Builder(this, factory)
+                      .setAudioAttributes(attrs, true)
+                      .setHandleAudioBecomingNoisy(true)
+                      .setWakeMode(C.WAKE_MODE_LOCAL)
+                      .build()
+                  player.repeatMode = Player.REPEAT_MODE_ALL
+                  session = MediaSession.Builder(this, player).build()
+              }
+
+              override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = session
+
+              override fun onTaskRemoved(rootIntent: Intent?) {
+                  val p = session?.player
+                  if (p == null || !p.playWhenReady || p.mediaItemCount == 0) stopSelf()
+              }
+
+              override fun onDestroy() {
+                  session?.run {
+                      player.release()
+                      release()
+                  }
+                  session = null
+                  super.onDestroy()
+              }
+          }
+          KOTLIN_EOF
+
+          cat > app/src/main/java/com/grey/pulse/VisualizerView.kt << 'KOTLIN_EOF'
+          package com.grey.pulse
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.view.View
+          import kotlin.math.abs
+          import kotlin.math.cos
+          import kotlin.math.exp
+          import kotlin.math.floor
+          import kotlin.math.min
+          import kotlin.math.pow
+          import kotlin.math.sin
+          import kotlin.random.Random
+
+          /**
+           * Black disc in the center with layered "solar flare" rings + drifting particles.
+           *
+           * Layers (inside -> outside):
+           *   center + L1 : black   (merged, same colour)
+           *   L2          : white, semi glowing
+           *   L3          : black
+           *   L4          : white, semi glowing
+           *
+           * Every layer is driven ONLY by the 16-60 Hz bands in AudioBus.levels.
+           * The 12 bands are laid over the half circle and mirrored left/right:
+           *   bottom = 16 Hz ... top = 60 Hz.
+           * Outer layers use older (delayed) levels, so a kick ripples outward.
+           */
+          class VisualizerView(ctx: Context) : View(ctx) {
+
+              @JvmField var playing = false
+
+              companion object {
+                  // ---- tunables ----
+                  const val CONTRAST = 2.0f      // higher = only strong bass moves the rings
+                  const val ATTACK = 28f         // how fast rings rise
+                  const val DECAY = 5f           // how fast rings fall
+                  const val SYNC_FRAMES = 6      // compensates audio-buffer latency (~100 ms at 60 fps)
+                  const val HIST = 40
+                  const val PARTICLES = 160
+                  const val POINTS = 160
+                  val BASE_R = floatArrayOf(0.30f, 0.42f, 0.54f, 0.66f) // L1..L4 radius (x u)
+                  val FLARE = floatArrayOf(0.05f, 0.11f, 0.10f, 0.18f)  // max flare growth
+                  val DELAY = intArrayOf(0, 3, 6, 10)                   // frames of ripple delay
+                  val WHITE = booleanArrayOf(false, true, false, true)
+                  val PIF = Math.PI.toFloat()
+              }
+
+              private val nb = AudioBus.BANDS
+              private val sm = FloatArray(nb)
+              private val hist = Array(HIST) { FloatArray(nb) }
+              private var head = 0
+              private var lastNs = 0L
+              private var time = 0f
+              private var energy = 0f
+              private val dens = ctx.resources.displayMetrics.density
+
+              private val path = Path()
+              private val fillWhite = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.argb(238, 255, 255, 255); style = Paint.Style.FILL
+              }
+              private val fillBlack = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.BLACK; style = Paint.Style.FILL
+              }
+              private val glow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE; strokeJoin = Paint.Join.ROUND
+              }
+              private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+
+              private val px = FloatArray(PARTICLES) { Random.nextFloat() }
+              private val py = FloatArray(PARTICLES) { Random.nextFloat() }
+              private val psz = FloatArray(PARTICLES) { Random.nextFloat() * 2.5f + 0.6f }
+              private val pspd = FloatArray(PARTICLES) { Random.nextFloat() * 0.35f + 0.12f }
+              private val pph = FloatArray(PARTICLES) { Random.nextFloat() * 6.28f }
+              private val ptw = FloatArray(PARTICLES) { Random.nextFloat() * 1.2f + 0.4f }
+
+              override fun onDraw(canvas: Canvas) {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  if (w <= 0f || h <= 0f) return
+                  val now = System.nanoTime()
+                  val dt = if (lastNs == 0L) 0.016f else ((now - lastNs) / 1_000_000_000f).coerceIn(0.001f, 0.05f)
+                  lastNs = now
+                  time += dt
+                  updateLevels(dt, now)
+                  drawParticles(canvas, w, h)
+                  drawRings(canvas, w, h)
+                  postInvalidateOnAnimation()
+              }
+
+              private fun updateLevels(dt: Float, now: Long) {
+                  val fresh = playing && (now - AudioBus.lastUpdateNs) < 250_000_000L
+                  val ka = 1f - exp(-dt * ATTACK)
+                  val kd = 1f - exp(-dt * DECAY)
+                  var sum = 0f
+                  for (i in 0 until nb) {
+                      val raw = if (fresh) AudioBus.levels[i] else 0f
+                      val t = raw.pow(CONTRAST)
+                      sm[i] += (t - sm[i]) * (if (t > sm[i]) ka else kd)
+                      sum += sm[i]
+                  }
+                  energy = sum / nb
+                  head = (head + 1) % HIST
+                  System.arraycopy(sm, 0, hist[head], 0, nb)
+              }
+
+              private fun drawParticles(canvas: Canvas, w: Float, h: Float) {
+                  for (i in 0 until PARTICLES) {
+                      val x = px[i] * w + sin(time * pspd[i] + pph[i]) * 14f * dens
+                      val y = py[i] * h + cos(time * pspd[i] * 0.8f + pph[i]) * 18f * dens
+                      val tw = 0.5f + 0.5f * sin(time * ptw[i] + pph[i])
+                      val a = (0.15f + 0.5f * tw + energy * 0.35f).coerceIn(0f, 1f)
+                      val r = psz[i] * dens * 0.5f * (1f + energy * 0.6f)
+                      if (psz[i] > 1.6f) {
+                          dot.alpha = (a * 70f).toInt()
+                          canvas.drawCircle(x, y, r * 2.6f, dot)
+                      }
+                      dot.alpha = (a * 255f).toInt()
+                      canvas.drawCircle(x, y, r, dot)
+                  }
+              }
+
+              private fun drawRings(canvas: Canvas, w: Float, h: Float) {
+                  val cx = w / 2f
+                  val cy = h * 0.40f
+                  val u = min(w * 0.5f, h * 0.32f)
+                  val pulse = 1f + 0.05f * energy
+                  val glowGain = 0.6f + 0.8f * energy
+
+                  for (l in 3 downTo 0) {
+                      val hh = hist[(head - DELAY[l] - SYNC_FRAMES + HIST * 2) % HIST]
+                      path.reset()
+                      for (k in 0 until POINTS) {
+                          val a = (k.toFloat() / POINTS) * 2f * PIF
+                          val f = if (a <= PIF) a / PIF else (2f * PIF - a) / PIF
+                          val bp = f * (nb - 1)
+                          val i0 = min(floor(bp).toInt(), nb - 2)
+                          val fr = bp - i0
+                          val s = fr * fr * (3f - 2f * fr)
+                          val v = hh[i0] + (hh[i0 + 1] - hh[i0]) * s
+                          val wob = 0.014f * sin(5f * a + time * 0.9f + l.toFloat()) +
+                              0.009f * sin(3f * a - time * 0.6f)
+                          val r = u * (BASE_R[l] * pulse + FLARE[l] * v + wob * 0.6f)
+                          val x = cx + r * sin(a)
+                          val y = cy + r * cos(a)
+                          if (k == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                      }
+                      path.close()
+                      if (WHITE[l]) {
+                          for (g in 0..2) {
+                              glow.color = Color.WHITE
+                              glow.alpha = ((46 - g * 13) * glowGain).toInt().coerceIn(0, 255)
+                              glow.strokeWidth = (8f + g * 12f) * dens
+                              canvas.drawPath(path, glow)
+                          }
+                          canvas.drawPath(path, fillWhite)
+                      } else {
+                          canvas.drawPath(path, fillBlack)
+                      }
+                  }
+              }
+          }
+          KOTLIN_EOF
+
+          cat > app/src/main/java/com/grey/pulse/MainActivity.kt << 'KOTLIN_EOF'
+          package com.grey.pulse
+
+          import android.Manifest
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.SystemBarStyle
+          import androidx.activity.compose.BackHandler
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.animation.AnimatedVisibility
+          import androidx.compose.animation.animateColorAsState
+          import androidx.compose.animation.core.LinearEasing
+          import androidx.compose.animation.core.RepeatMode
+          import androidx.compose.animation.core.animateFloat
+          import androidx.compose.animation.core.infiniteRepeatable
+          import androidx.compose.animation.core.rememberInfiniteTransition
+          import androidx.compose.animation.core.tween
+          import androidx.compose.animation.core.animateDpAsState
+          import androidx.compose.animation.fadeIn
+          import androidx.compose.animation.fadeOut
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+          import androidx.compose.foundation.gestures.detectTapGestures
+          import androidx.compose.foundation.interaction.MutableInteractionSource
+          import androidx.compose.foundation.interaction.collectIsPressedAsState
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.navigationBarsPadding
+          import androidx.compose.foundation.layout.offset
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.layout.statusBarsPadding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.lazy.itemsIndexed
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.BasicTextField
+          import androidx.compose.foundation.text.KeyboardActions
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.DisposableEffect
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableLongStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.rememberUpdatedState
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.composed
+          import androidx.compose.ui.draw.alpha
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.Path
+          import androidx.compose.ui.graphics.SolidColor
+          import androidx.compose.ui.graphics.StrokeCap
+          import androidx.compose.ui.graphics.drawscope.DrawScope
+          import androidx.compose.ui.graphics.drawscope.scale
+          import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.layout.onSizeChanged
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.ImeAction
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.Dp
+          import androidx.compose.ui.unit.IntOffset
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.core.content.ContextCompat
+          import androidx.media3.common.C
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.MediaMetadata
+          import androidx.media3.common.Player
+          import androidx.media3.session.MediaController
+          import androidx.media3.session.SessionToken
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import kotlin.math.roundToInt
+
+          // ---------------------------------------------------------------- colors
+          private val CText = Color(0xFFF5F5F7)
+          private val CDim = Color(0xFF8F8F99)
+          private val CSurf2 = Color(0xFF33333A)
+          private val CSurf3 = Color(0xFF44444C)
+          private val CHeart = Color(0xFFFF6B81)
+          private val CGreen = Color(0xFF4ADE80)
+          private val CAmber = Color(0xFFFBBF24)
+
+          // ---------------------------------------------------------------- activity
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge(
+                      statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+                      navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                  )
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme()) {
+                          PulseApp()
+                      }
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- data
+          data class Track(val id: Long, val title: String, val artist: String, val durMs: Long, val uri: Uri)
+
+          enum class Panel { None, List, Menu, Eq }
+
+          fun scanTracks(ctx: Context): List<Track> {
+              val list = ArrayList<Track>()
+              try {
+                  val uri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                  val proj = arrayOf(
+                      MediaStore.Audio.Media._ID,
+                      MediaStore.Audio.Media.TITLE,
+                      MediaStore.Audio.Media.ARTIST,
+                      MediaStore.Audio.Media.DURATION
+                  )
+                  val sel = MediaStore.Audio.Media.IS_RINGTONE + "=0 AND " +
+                      MediaStore.Audio.Media.IS_NOTIFICATION + "=0 AND " +
+                      MediaStore.Audio.Media.IS_ALARM + "=0 AND " +
+                      MediaStore.Audio.Media.DURATION + ">=5000"
+                  ctx.contentResolver.query(uri, proj, sel, null, MediaStore.Audio.Media.TITLE + " COLLATE NOCASE ASC")?.use { c ->
+                      while (c.moveToNext()) {
+                          val id = c.getLong(0)
+                          val title = c.getString(1) ?: "Unknown"
+                          var artist = c.getString(2) ?: ""
+                          if (artist == MediaStore.UNKNOWN_STRING || artist.isBlank()) artist = "Unknown artist"
+                          val dur = c.getLong(3)
+                          list.add(Track(id, title, artist, dur, android.content.ContentUris.withAppendedId(uri, id)))
+                      }
+                  }
+              } catch (e: Exception) {
+              }
+              return list
+          }
+
+          fun fmtMs(ms: Long): String {
+              val s = (ms.coerceAtLeast(0L) / 1000f).roundToInt()
+              return (s / 60).toString() + ":" + (s % 60).toString().padStart(2, '0')
+          }
+
+          // ---------------------------------------------------------------- state holder
+          class PlayerVm(val app: Context, val scope: CoroutineScope) {
+              var tracks by mutableStateOf(listOf<Track>())
+              var nowId by mutableStateOf("")
+              var title by mutableStateOf("GreyPulse")
+              var artist by mutableStateOf("Menu > Scan Files to find songs")
+              var isPlaying by mutableStateOf(false)
+              var hasQueue by mutableStateOf(false)
+              var posMs by mutableLongStateOf(0L)
+              var durMs by mutableLongStateOf(0L)
+              var eqOn by mutableStateOf(false)
+              var eqBands by mutableStateOf(listOf<EqBand>())
+              var controller: MediaController? = null
+
+              private val prefs = app.getSharedPreferences("pulse", Context.MODE_PRIVATE)
+
+              private val listener = object : Player.Listener {
+                  override fun onEvents(player: Player, events: Player.Events) {
+                      sync()
+                  }
+              }
+
+              init {
+                  loadEq()
+              }
+
+              fun attach(c: MediaController) {
+                  controller = c
+                  c.addListener(listener)
+                  sync()
+              }
+
+              fun detach() {
+                  controller?.removeListener(listener)
+                  controller = null
+              }
+
+              fun sync() {
+                  val c = controller ?: return
+                  val mi = c.currentMediaItem
+                  hasQueue = c.mediaItemCount > 0
+                  nowId = mi?.mediaId ?: ""
+                  if (mi != null) {
+                      title = mi.mediaMetadata.title?.toString() ?: "Unknown"
+                      artist = mi.mediaMetadata.artist?.toString() ?: ""
+                  }
+                  isPlaying = c.isPlaying
+                  val d = c.duration
+                  durMs = if (d != C.TIME_UNSET && d > 0) d else (mi?.mediaMetadata?.durationMs ?: 0L)
+                  posMs = c.currentPosition
+              }
+
+              fun pollPos() {
+                  val c = controller ?: return
+                  posMs = c.currentPosition
+              }
+
+              private fun items(): List<MediaItem> = tracks.map {
+                  MediaItem.Builder()
+                      .setMediaId(it.id.toString())
+                      .setUri(it.uri)
+                      .setMediaMetadata(
+                          MediaMetadata.Builder()
+                              .setTitle(it.title)
+                              .setArtist(it.artist)
+                              .setDurationMs(it.durMs)
+                              .build()
+                      )
+                      .build()
+              }
+
+              private fun queueMatches(c: MediaController): Boolean {
+                  if (tracks.isEmpty() || c.mediaItemCount != tracks.size) return false
+                  return c.getMediaItemAt(0).mediaId == tracks[0].id.toString() &&
+                      c.getMediaItemAt(c.mediaItemCount - 1).mediaId == tracks.last().id.toString()
+              }
+
+              fun playIndex(i: Int) {
+                  val c = controller ?: return
+                  if (tracks.isEmpty() || i !in tracks.indices) return
+                  if (queueMatches(c)) {
+                      c.seekTo(i, 0L)
+                  } else {
+                      c.setMediaItems(items(), i, 0L)
+                  }
+                  c.prepare()
+                  c.play()
+              }
+
+              fun togglePlay() {
+                  val c = controller ?: return
+                  if (!hasQueue) {
+                      if (tracks.isNotEmpty()) playIndex(0)
+                      return
+                  }
+                  if (c.isPlaying) {
+                      c.pause()
+                  } else {
+                      if (c.playbackState == Player.STATE_IDLE) c.prepare()
+                      c.play()
+                  }
+              }
+
+              fun next() {
+                  val c = controller ?: return
+                  if (!hasQueue) { if (tracks.isNotEmpty()) playIndex(0); return }
+                  c.seekToNextMediaItem()
+                  c.play()
+              }
+
+              fun prev() {
+                  val c = controller ?: return
+                  if (!hasQueue) { if (tracks.isNotEmpty()) playIndex(0); return }
+                  c.seekToPreviousMediaItem()
+                  c.play()
+              }
+
+              fun seekFrac(f: Float) {
+                  val c = controller ?: return
+                  if (durMs <= 0) return
+                  val p = (f * durMs).toLong()
+                  c.seekTo(p)
+                  posMs = p
+              }
+
+              fun hasAudioPerm(): Boolean {
+                  val p = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO
+                  else Manifest.permission.READ_EXTERNAL_STORAGE
+                  return ContextCompat.checkSelfPermission(app, p) == PackageManager.PERMISSION_GRANTED
+              }
+
+              fun scan(manual: Boolean) {
+                  if (!hasAudioPerm()) {
+                      if (manual) Toast.makeText(app, "Allow audio permission to find songs", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  scope.launch {
+                      val r = withContext(Dispatchers.IO) { scanTracks(app) }
+                      tracks = r
+                      if (manual) Toast.makeText(app, "Found " + r.size + " songs", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              // ---- equalizer persistence
+              private fun loadEq() {
+                  eqOn = prefs.getBoolean("on", false)
+                  val s = prefs.getString("bands", "") ?: ""
+                  eqBands = s.split(",").mapNotNull { p ->
+                      val kv = p.split(":")
+                      if (kv.size == 2) {
+                          val f = kv[0].toIntOrNull()
+                          val g = kv[1].toIntOrNull()
+                          if (f != null && g != null) EqBand(f, g.coerceIn(-50, 0)) else null
+                      } else null
+                  }.sortedBy { it.freq }
+                  AudioBus.setEq(eqOn, eqBands)
+              }
+
+              fun pushEq() {
+                  AudioBus.setEq(eqOn, eqBands)
+                  prefs.edit()
+                      .putBoolean("on", eqOn)
+                      .putString("bands", eqBands.joinToString(",") { it.freq.toString() + ":" + it.gain })
+                      .apply()
+              }
+          }
+
+          // ---------------------------------------------------------------- helpers
+          fun Modifier.tap(onClick: () -> Unit): Modifier = composed {
+              val src = remember { MutableInteractionSource() }
+              val pressed by src.collectIsPressedAsState()
+              this.alpha(if (pressed) 0.55f else 1f)
+                  .clickable(interactionSource = src, indication = null, onClick = onClick)
+          }
+
+          @Composable
+          fun Ico(dp: Dp, content: DrawScope.() -> Unit) {
+              Canvas(Modifier.size(dp)) {
+                  val s = this.size.width / 24f
+                  scale(s, s, pivot = Offset.Zero) { content() }
+              }
+          }
+
+          fun DrawScope.ln(c: Color, x1: Float, y1: Float, x2: Float, y2: Float, w: Float = 2.4f) {
+              drawLine(c, Offset(x1, y1), Offset(x2, y2), w, StrokeCap.Round)
+          }
+
+          fun DrawScope.tri(c: Color, x1: Float, y1: Float, x2: Float, y2: Float, x3: Float, y3: Float) {
+              val p = Path()
+              p.moveTo(x1, y1); p.lineTo(x2, y2); p.lineTo(x3, y3); p.close()
+              drawPath(p, c)
+          }
+
+          @Composable
+          fun IconListBtn() = Ico(22.dp) {
+              ln(Color.White, 4f, 7f, 20f, 7f); ln(Color.White, 4f, 12f, 20f, 12f); ln(Color.White, 4f, 17f, 14f, 17f)
+          }
+
+          @Composable
+          fun IconBack() = Ico(22.dp) {
+              ln(Color.White, 15f, 18f, 9f, 12f); ln(Color.White, 9f, 12f, 15f, 6f)
+          }
+
+          @Composable
+          fun IconDots() = Ico(22.dp) {
+              drawCircle(Color.White, 1.8f, Offset(12f, 5f))
+              drawCircle(Color.White, 1.8f, Offset(12f, 12f))
+              drawCircle(Color.White, 1.8f, Offset(12f, 19f))
+          }
+
+          @Composable
+          fun IconPlay(c: Color, dp: Dp) = Ico(dp) { tri(c, 8f, 5f, 8f, 19f, 19f, 12f) }
+
+          @Composable
+          fun IconPause(c: Color, dp: Dp) = Ico(dp) {
+              drawRect(c, Offset(7f, 5f), Size(4f, 14f)); drawRect(c, Offset(13f, 5f), Size(4f, 14f))
+          }
+
+          @Composable
+          fun IconPrev() = Ico(26.dp) {
+              drawRect(CText, Offset(6f, 5f), Size(2f, 14f)); tri(CText, 20f, 5f, 20f, 19f, 9f, 12f)
+          }
+
+          @Composable
+          fun IconNext() = Ico(26.dp) {
+              drawRect(CText, Offset(16f, 5f), Size(2f, 14f)); tri(CText, 4f, 5f, 4f, 19f, 15f, 12f)
+          }
+
+          @Composable
+          fun IconEq() = Ico(20.dp) {
+              ln(Color.White, 4f, 20f, 4f, 10f, 2f); ln(Color.White, 10f, 20f, 10f, 4f, 2f)
+              ln(Color.White, 16f, 20f, 16f, 14f, 2f); ln(Color.White, 22f, 20f, 22f, 8f, 2f)
+          }
+
+          @Composable
+          fun IconScan() = Ico(20.dp) {
+              val c = Color.White
+              ln(c, 3f, 7f, 3f, 3f, 2f); ln(c, 3f, 3f, 7f, 3f, 2f)
+              ln(c, 17f, 3f, 21f, 3f, 2f); ln(c, 21f, 3f, 21f, 7f, 2f)
+              ln(c, 21f, 17f, 21f, 21f, 2f); ln(c, 21f, 21f, 17f, 21f, 2f)
+              ln(c, 7f, 21f, 3f, 21f, 2f); ln(c, 3f, 21f, 3f, 17f, 2f)
+              ln(c, 7f, 12f, 17f, 12f, 2f)
+          }
+
+          @Composable
+          fun IconNote() = Ico(18.dp) {
+              val c = Color.White
+              ln(c, 9f, 18f, 9f, 6f, 2f); ln(c, 9f, 6f, 19f, 4f, 2f); ln(c, 19f, 4f, 19f, 16f, 2f)
+              drawCircle(c, 3f, Offset(6f, 18f)); drawCircle(c, 3f, Offset(16f, 16f))
+          }
+
+          @Composable
+          fun IconPlus() = Ico(14.dp) {
+              ln(Color(0xFF0E0E10), 12f, 5f, 12f, 19f, 2.6f); ln(Color(0xFF0E0E10), 5f, 12f, 19f, 12f, 2.6f)
+          }
+
+          @Composable
+          fun IconTrash() = Ico(26.dp) {
+              val c = CHeart
+              ln(c, 3f, 6f, 21f, 6f, 2.2f)
+              ln(c, 9f, 6f, 9f, 3f, 2.2f); ln(c, 9f, 3f, 15f, 3f, 2.2f); ln(c, 15f, 3f, 15f, 6f, 2.2f)
+              ln(c, 5f, 6f, 6f, 20f, 2.2f); ln(c, 6f, 20f, 18f, 20f, 2.2f); ln(c, 19f, 6f, 18f, 20f, 2.2f)
+              ln(c, 10f, 11f, 10f, 17f, 2.2f); ln(c, 14f, 11f, 14f, 17f, 2.2f)
+          }
+
+          @Composable
+          fun EqBars(animate: Boolean) {
+              val tr = rememberInfiniteTransition(label = "eq")
+              val a0 by tr.animateFloat(0.4f, 1f, infiniteRepeatable(tween(600, easing = LinearEasing), RepeatMode.Reverse), label = "a0")
+              val a1 by tr.animateFloat(0.4f, 1f, infiniteRepeatable(tween(780, easing = LinearEasing), RepeatMode.Reverse), label = "a1")
+              val a2 by tr.animateFloat(0.4f, 1f, infiniteRepeatable(tween(900, easing = LinearEasing), RepeatMode.Reverse), label = "a2")
+              Canvas(Modifier.size(width = 16.dp, height = 14.dp)) {
+                  val bw = 3.dp.toPx()
+                  val gap = 2.dp.toPx()
+                  val hs = if (animate) floatArrayOf(0.4f * a0, 0.9f * a1, 0.6f * a2) else floatArrayOf(0.4f, 0.9f, 0.6f)
+                  for (i in 0..2) {
+                      val bh = size.height * hs[i]
+                      drawRoundRect(
+                          Color.White,
+                          topLeft = Offset(i * (bw + gap), size.height - bh),
+                          size = Size(bw, bh),
+                          cornerRadius = androidx.compose.ui.geometry.CornerRadius(2.dp.toPx())
+                      )
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- root
+          @Composable
+          fun PulseApp() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val vm = remember { PlayerVm(ctx.applicationContext, scope) }
+              var panel by remember { mutableStateOf(Panel.None) }
+              var pendingDelete by remember { mutableStateOf<Int?>(null) }
+              val manualScan = remember { booleanArrayOf(false) }
+
+              val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+                  vm.scan(manualScan[0])
+                  manualScan[0] = false
+              }
+
+              fun requestAndScan(manual: Boolean) {
+                  manualScan[0] = manual
+                  val perms = if (Build.VERSION.SDK_INT >= 33)
+                      arrayOf(Manifest.permission.READ_MEDIA_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
+                  else arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+                  val need = perms.filter { ContextCompat.checkSelfPermission(ctx, it) != PackageManager.PERMISSION_GRANTED }
+                  if (need.isEmpty()) {
+                      vm.scan(manual)
+                      manualScan[0] = false
+                  } else {
+                      permLauncher.launch(need.toTypedArray())
+                  }
+              }
+
+              LaunchedEffect(Unit) { requestAndScan(false) }
+
+              DisposableEffect(Unit) {
+                  val token = SessionToken(ctx, ComponentName(ctx, PlaybackService::class.java))
+                  val future = MediaController.Builder(ctx, token).buildAsync()
+                  future.addListener({
+                      try {
+                          vm.attach(future.get())
+                      } catch (e: Exception) {
+                      }
+                  }, ContextCompat.getMainExecutor(ctx))
+                  onDispose {
+                      vm.detach()
+                      MediaController.releaseFuture(future)
+                  }
+              }
+
+              LaunchedEffect(Unit) {
+                  while (true) {
+                      vm.pollPos()
+                      delay(250)
+                  }
+              }
+
+              BackHandler(enabled = panel != Panel.None) { panel = Panel.None }
+
+              Box(
+                  Modifier
+                      .fillMaxSize()
+                      .background(Brush.verticalGradient(listOf(Color(0xFF18181B), Color(0xFF0E0E10))))
+              ) {
+                  AndroidView(
+                      factory = { VisualizerView(it) },
+                      update = { it.playing = vm.isPlaying },
+                      modifier = Modifier.fillMaxSize()
+                  )
+
+                  Column(Modifier.fillMaxSize()) {
+                      TopBar(
+                          vm = vm,
+                          panel = panel,
+                          onLeft = { panel = if (panel == Panel.None) Panel.List else Panel.None },
+                          onRight = { panel = Panel.Menu }
+                      )
+                      Box(Modifier.weight(1f).fillMaxWidth()) {
+                          Overlay(panel == Panel.List) {
+                              ListPanel(vm) { panel = Panel.None }
+                          }
+                          Overlay(panel == Panel.Menu) {
+                              MenuPanel(
+                                  onEq = { panel = Panel.Eq },
+                                  onScan = { panel = Panel.None; requestAndScan(true) }
+                              )
+                          }
+                          Overlay(panel == Panel.Eq) {
+                              EqPanel(vm) { idx -> pendingDelete = idx }
+                          }
+                      }
+                      Controls(vm)
+                  }
+
+                  val pd = pendingDelete
+                  if (pd != null && pd in vm.eqBands.indices) {
+                      val band = vm.eqBands[pd]
+                      ConfirmDelete(
+                          freq = band.freq,
+                          onCancel = { pendingDelete = null },
+                          onDelete = {
+                              vm.eqBands = vm.eqBands.filterIndexed { i, _ -> i != pd }
+                              vm.pushEq()
+                              pendingDelete = null
+                          }
+                      )
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- top bar
+          @Composable
+          fun TopBar(vm: PlayerVm, panel: Panel, onLeft: () -> Unit, onRight: () -> Unit) {
+              val dotColor = if (!vm.hasQueue) CHeart else if (vm.isPlaying) CGreen else CAmber
+              val label = if (!vm.hasQueue) "Ready" else if (vm.isPlaying) "Playing" else "Paused"
+              Row(
+                  Modifier.fillMaxWidth().statusBarsPadding().height(72.dp).padding(horizontal = 18.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Box(Modifier.size(44.dp).tap(onLeft), contentAlignment = Alignment.Center) {
+                      if (panel == Panel.None) IconListBtn() else IconBack()
+                  }
+                  Row(Modifier.weight(1f), Arrangement.Center, Alignment.CenterVertically) {
+                      Box(Modifier.size(8.dp).clip(CircleShape).background(dotColor))
+                      Box(Modifier.width(8.dp))
+                      Text(
+                          label.uppercase(), color = CDim, fontSize = 12.sp,
+                          fontWeight = FontWeight.SemiBold, letterSpacing = 1.4.sp
+                      )
+                  }
+                  Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
+                      if (panel == Panel.None) {
+                          Box(Modifier.size(44.dp).tap(onRight), contentAlignment = Alignment.Center) { IconDots() }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun Overlay(visible: Boolean, content: @Composable () -> Unit) {
+              AnimatedVisibility(visible, enter = fadeIn(tween(300)), exit = fadeOut(tween(300))) {
+                  Column(
+                      Modifier
+                          .fillMaxSize()
+                          .background(
+                              Brush.verticalGradient(
+                                  listOf(Color(0xE60A0A0C), Color(0xCC0A0A0C), Color(0x990A0A0C))
+                              )
+                          )
+                          .padding(horizontal = 18.dp)
+                          .pointerInput(Unit) { detectTapGestures { } }
+                  ) {
+                      content()
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- list
+          @Composable
+          fun ListPanel(vm: PlayerVm, onPicked: () -> Unit) {
+              if (vm.tracks.isEmpty()) {
+                  Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                      Text(
+                          "No songs yet.\nOpen the menu and tap Scan Files.",
+                          color = CDim, fontSize = 13.sp, textAlign = TextAlign.Center, lineHeight = 20.sp
+                      )
+                  }
+                  return
+              }
+              LazyColumn(Modifier.fillMaxSize()) {
+                  itemsIndexed(vm.tracks, key = { _, t -> t.id }) { i, t ->
+                      val cur = t.id.toString() == vm.nowId
+                      Row(
+                          Modifier
+                              .fillMaxWidth()
+                              .padding(vertical = 2.dp)
+                              .clip(RoundedCornerShape(14.dp))
+                              .background(if (cur) Color(0x10FFFFFF) else Color.Transparent)
+                              .tap { vm.playIndex(i); onPicked() }
+                              .padding(10.dp),
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Box(
+                              Modifier.size(44.dp).clip(RoundedCornerShape(10.dp)).background(CSurf2),
+                              contentAlignment = Alignment.Center
+                          ) {
+                              if (cur) EqBars(vm.isPlaying) else IconNote()
+                          }
+                          Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                              Text(
+                                  t.title, color = if (cur) Color.White else CText, fontSize = 14.sp,
+                                  fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis
+                              )
+                              Text(t.artist, color = CDim, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                          }
+                          Text(fmtMs(t.durMs), color = CDim, fontSize = 11.sp)
+                      }
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- menu
+          @Composable
+          fun MenuPanel(onEq: () -> Unit, onScan: () -> Unit) {
+              Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                  MenuRow("Equalizer", "Add bands and shape the sound", onEq) { IconEq() }
+                  MenuRow("Scan Files", "Find songs on this device", onScan) { IconScan() }
+              }
+          }
+
+          @Composable
+          fun MenuRow(title: String, sub: String, onClick: () -> Unit, icon: @Composable () -> Unit) {
+              Row(
+                  Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).tap(onClick).padding(12.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Box(
+                      Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(CSurf2),
+                      contentAlignment = Alignment.Center
+                  ) { icon() }
+                  Column(Modifier.padding(start = 14.dp)) {
+                      Text(title, color = CText, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                      Text(sub, color = CDim, fontSize = 11.sp)
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- equalizer
+          @Composable
+          fun Toggle(on: Boolean, onChange: (Boolean) -> Unit) {
+              val bg by animateColorAsState(if (on) CGreen else CSurf3, label = "tg")
+              val x by animateDpAsState(if (on) 25.dp else 3.dp, label = "tk")
+              Box(
+                  Modifier
+                      .size(52.dp, 30.dp)
+                      .clip(RoundedCornerShape(99.dp))
+                      .background(bg)
+                      .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onChange(!on) }
+              ) {
+                  Box(Modifier.offset(x, 3.dp).size(24.dp).clip(CircleShape).background(Color.White))
+              }
+          }
+
+          @Composable
+          fun EqPanel(vm: PlayerVm, askDelete: (Int) -> Unit) {
+              Column(Modifier.fillMaxSize()) {
+                  Row(
+                      Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 6.dp, bottom = 14.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Column(Modifier.weight(1f)) {
+                          Text("Equalizer", color = CText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                          Text("BANDS", color = CDim, fontSize = 11.sp, letterSpacing = 0.6.sp)
+                      }
+                      Toggle(vm.eqOn) { vm.eqOn = it; vm.pushEq() }
+                  }
+
+                  AddForm(vm)
+
+                  Row(
+                      Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                      horizontalArrangement = Arrangement.SpaceBetween
+                  ) {
+                      for (s in listOf("-50", "-40", "-30", "-20", "-10", "0 dB")) {
+                          Text(s, color = CDim, fontSize = 10.sp)
+                      }
+                  }
+                  Box(Modifier.fillMaxWidth().height(1.dp).background(Color(0x12FFFFFF)))
+
+                  Box(Modifier.weight(1f).fillMaxWidth().alpha(if (vm.eqOn) 1f else 0.35f)) {
+                      if (vm.eqBands.isEmpty()) {
+                          Text(
+                              "No bands yet.\nType a frequency above and tap Add.",
+                              color = CDim, fontSize = 12.sp, textAlign = TextAlign.Center, lineHeight = 18.sp,
+                              modifier = Modifier.fillMaxWidth().padding(22.dp)
+                          )
+                      } else {
+                          LazyColumn(Modifier.fillMaxSize()) {
+                              itemsIndexed(vm.eqBands, key = { _, b -> b.freq }) { i, b ->
+                                  BandRow(
+                                      b = b,
+                                      enabled = vm.eqOn,
+                                      onGain = { g ->
+                                          vm.eqBands = vm.eqBands.map { if (it.freq == b.freq) it.copy(gain = g) else it }
+                                          vm.pushEq()
+                                      },
+                                      onDelete = { askDelete(i) }
+                                  )
+                              }
+                          }
+                      }
+                  }
+                  Text(
+                      "ENTER A FREQUENCY ABOVE, THEN TAP ADD",
+                      color = Color(0x55FFFFFF), fontSize = 10.sp, letterSpacing = 0.6.sp,
+                      textAlign = TextAlign.Center,
+                      modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                  )
+              }
+          }
+
+          @Composable
+          fun AddForm(vm: PlayerVm) {
+              var text by remember { mutableStateOf("") }
+              val value = text.toIntOrNull()
+              val valid = value != null && value in 1..20000
+
+              fun add() {
+                  val f = text.toIntOrNull() ?: return
+                  if (f !in 1..20000) return
+                  if (vm.eqBands.none { it.freq == f }) {
+                      vm.eqBands = (vm.eqBands + EqBand(f, 0)).sortedBy { it.freq }
+                      vm.pushEq()
+                  }
+                  text = ""
+              }
+
+              Row(
+                  Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 10.dp, bottom = 12.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Row(
+                      Modifier
+                          .weight(1f)
+                          .height(40.dp)
+                          .clip(RoundedCornerShape(12.dp))
+                          .background(Color(0x10FFFFFF))
+                          .border(1.dp, Color(0x1AFFFFFF), RoundedCornerShape(12.dp))
+                          .padding(horizontal = 10.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      BasicTextField(
+                          value = text,
+                          onValueChange = { v -> text = v.filter { it.isDigit() }.take(5) },
+                          singleLine = true,
+                          textStyle = TextStyle(color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold),
+                          cursorBrush = SolidColor(Color.White),
+                          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+                          keyboardActions = KeyboardActions(onDone = { add() }),
+                          modifier = Modifier.weight(1f),
+                          decorationBox = { inner ->
+                              Box(contentAlignment = Alignment.CenterStart) {
+                                  if (text.isEmpty()) Text("Frequency", color = Color(0x55FFFFFF), fontSize = 14.sp)
+                                  inner()
+                              }
+                          }
+                      )
+                      Text("HZ", color = CDim, fontSize = 11.sp, letterSpacing = 0.6.sp)
+                  }
+                  Box(Modifier.width(8.dp))
+                  Row(
+                      Modifier
+                          .height(40.dp)
+                          .alpha(if (valid) 1f else 0.35f)
+                          .clip(RoundedCornerShape(12.dp))
+                          .background(Brush.linearGradient(listOf(Color(0xFFF7F7FA), Color(0xFFC9C9D2))))
+                          .clickable(
+                              interactionSource = remember { MutableInteractionSource() },
+                              indication = null,
+                              enabled = valid
+                          ) { add() }
+                          .padding(horizontal = 14.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      IconPlus()
+                      Box(Modifier.width(6.dp))
+                      Text("Add", color = Color(0xFF0E0E10), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                  }
+              }
+          }
+
+          fun gainFor(x: Float, w: Float): Int = (-50f + (x / w).coerceIn(0f, 1f) * 50f).roundToInt()
+
+          @Composable
+          fun BandRow(b: EqBand, enabled: Boolean, onGain: (Int) -> Unit, onDelete: () -> Unit) {
+              val cb by rememberUpdatedState(onGain)
+              var wPx by remember { mutableStateOf(1f) }
+              val pct = ((b.gain + 50) / 50f).coerceIn(0f, 1f)
+              Row(
+                  Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 10.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Text(
+                      b.freq.toString() + " Hz", color = Color(0xCCFFFFFF), fontSize = 12.sp,
+                      fontWeight = FontWeight.SemiBold, modifier = Modifier.width(56.dp)
+                  )
+                  Box(
+                      Modifier
+                          .weight(1f)
+                          .height(32.dp)
+                          .onSizeChanged { wPx = it.width.toFloat().coerceAtLeast(1f) }
+                          .pointerInput(enabled) {
+                              if (!enabled) return@pointerInput
+                              detectTapGestures { o -> cb(gainFor(o.x, wPx)) }
+                          }
+                          .pointerInput(enabled) {
+                              if (!enabled) return@pointerInput
+                              detectHorizontalDragGestures(
+                                  onDragStart = { o -> cb(gainFor(o.x, wPx)) },
+                                  onHorizontalDrag = { ch, _ -> cb(gainFor(ch.position.x, wPx)) }
+                              )
+                          },
+                      contentAlignment = Alignment.CenterStart
+                  ) {
+                      Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(99.dp)).background(CSurf3))
+                      Box(
+                          Modifier.fillMaxWidth(pct).height(4.dp).clip(RoundedCornerShape(99.dp))
+                              .background(Color(0xCCFFFFFF))
+                      )
+                      Box(
+                          Modifier
+                              .offset { IntOffset((pct * wPx - 7.dp.toPx()).roundToInt(), 0) }
+                              .size(14.dp)
+                              .clip(CircleShape)
+                              .background(Color.White)
+                      )
+                  }
+                  Text(
+                      b.gain.toString() + " dB", color = CDim, fontSize = 11.sp, textAlign = TextAlign.End,
+                      modifier = Modifier.width(52.dp)
+                  )
+                  Box(
+                      Modifier
+                          .size(26.dp)
+                          .clip(CircleShape)
+                          .background(Color(0x10FFFFFF))
+                          .tap(onDelete),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Text("x", color = Color(0x88FFFFFF), fontSize = 14.sp)
+                  }
+              }
+          }
+
+          @Composable
+          fun ConfirmDelete(freq: Int, onCancel: () -> Unit, onDelete: () -> Unit) {
+              Box(
+                  Modifier
+                      .fillMaxSize()
+                      .background(Color(0xAA000000))
+                      .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onCancel() }
+                      .padding(24.dp),
+                  contentAlignment = Alignment.Center
+              ) {
+                  Column(
+                      Modifier
+                          .width(320.dp)
+                          .clip(RoundedCornerShape(20.dp))
+                          .background(Brush.verticalGradient(listOf(Color(0xFF2A2A30), Color(0xFF1E1E23))))
+                          .border(1.dp, Color(0x14FFFFFF), RoundedCornerShape(20.dp))
+                          .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { }
+                          .padding(start = 20.dp, end = 20.dp, top = 22.dp, bottom = 18.dp),
+                      horizontalAlignment = Alignment.CenterHorizontally
+                  ) {
+                      Box(
+                          Modifier.size(52.dp).clip(CircleShape).background(Color(0x22FF6B81)),
+                          contentAlignment = Alignment.Center
+                      ) { IconTrash() }
+                      Box(Modifier.height(14.dp))
+                      Text("Delete band?", color = CText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                      Box(Modifier.height(6.dp))
+                      Text(
+                          "Remove the " + freq + " Hz band from your equalizer?",
+                          color = CDim, fontSize = 13.sp, textAlign = TextAlign.Center, lineHeight = 19.sp
+                      )
+                      Box(Modifier.height(18.dp))
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                          Box(
+                              Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(12.dp))
+                                  .background(Color(0x14FFFFFF)).tap(onCancel),
+                              contentAlignment = Alignment.Center
+                          ) { Text("Cancel", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+                          Box(
+                              Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(12.dp))
+                                  .background(CHeart).tap(onDelete),
+                              contentAlignment = Alignment.Center
+                          ) { Text("Delete", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+                      }
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- bottom controls
+          @Composable
+          fun Controls(vm: PlayerVm) {
+              Column(
+                  Modifier
+                      .fillMaxWidth()
+                      .navigationBarsPadding()
+                      .padding(start = 22.dp, end = 22.dp, bottom = 24.dp)
+              ) {
+                  Column(Modifier.fillMaxWidth().padding(bottom = 20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                      Text(
+                          vm.title, color = CText, fontSize = 20.sp, fontWeight = FontWeight.Bold,
+                          maxLines = 1, overflow = TextOverflow.Ellipsis
+                      )
+                      Text(vm.artist, color = CDim, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  }
+                  SeekBar(vm)
+                  Box(Modifier.height(22.dp))
+                  Row(
+                      Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.spacedBy(28.dp, Alignment.CenterHorizontally),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Box(Modifier.size(44.dp).tap { vm.prev() }, contentAlignment = Alignment.Center) { IconPrev() }
+                      Box(
+                          Modifier
+                              .size(68.dp)
+                              .clip(CircleShape)
+                              .background(Brush.linearGradient(listOf(Color(0xFFF7F7FA), Color(0xFFC9C9D2))))
+                              .tap { vm.togglePlay() },
+                          contentAlignment = Alignment.Center
+                      ) {
+                          if (vm.isPlaying) IconPause(Color(0xFF0E0E10), 30.dp) else IconPlay(Color(0xFF0E0E10), 30.dp)
+                      }
+                      Box(Modifier.size(44.dp).tap { vm.next() }, contentAlignment = Alignment.Center) { IconNext() }
+                  }
+              }
+          }
+
+          @Composable
+          fun SeekBar(vm: PlayerVm) {
+              var drag by remember { mutableStateOf<Float?>(null) }
+              var wPx by remember { mutableStateOf(1f) }
+              val d = drag
+              val frac = d ?: if (vm.durMs > 0) (vm.posMs.toFloat() / vm.durMs).coerceIn(0f, 1f) else 0f
+              Column(Modifier.fillMaxWidth()) {
+                  Box(
+                      Modifier
+                          .fillMaxWidth()
+                          .height(28.dp)
+                          .onSizeChanged { wPx = it.width.toFloat().coerceAtLeast(1f) }
+                          .pointerInput(Unit) {
+                              detectTapGestures { o -> vm.seekFrac((o.x / wPx).coerceIn(0f, 1f)) }
+                          }
+                          .pointerInput(Unit) {
+                              detectHorizontalDragGestures(
+                                  onDragStart = { o -> drag = (o.x / wPx).coerceIn(0f, 1f) },
+                                  onDragEnd = {
+                                      val v = drag
+                                      if (v != null) vm.seekFrac(v)
+                                      drag = null
+                                  },
+                                  onDragCancel = { drag = null },
+                                  onHorizontalDrag = { ch, _ -> drag = (ch.position.x / wPx).coerceIn(0f, 1f) }
+                              )
+                          },
+                      contentAlignment = Alignment.CenterStart
+                  ) {
+                      Box(Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(99.dp)).background(CSurf3))
+                      Box(
+                          Modifier.fillMaxWidth(frac).height(6.dp).clip(RoundedCornerShape(99.dp))
+                              .background(Brush.horizontalGradient(listOf(Color(0xFFF5F5F7), Color(0xFFB8B8C2))))
+                      )
+                      Box(
+                          Modifier
+                              .offset { IntOffset((frac * wPx - 7.dp.toPx()).roundToInt(), 0) }
+                              .size(14.dp)
+                              .clip(CircleShape)
+                              .background(Color.White)
+                      )
+                  }
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                      Text(fmtMs((frac * vm.durMs).toLong()), color = CDim, fontSize = 11.sp)
+                      Text(fmtMs(vm.durMs), color = CDim, fontSize = 11.sp)
+                  }
+              }
+          }
+          KOTLIN_EOF
+
+      - name: Generate dummy keystore
+        run: |
+          keytool -genkeypair -v -keystore app/dummy.keystore -alias dummy \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass password -keypass password \
+            -dname "CN=GreyPulse, OU=Dev, O=Grey, L=NA, S=NA, C=US"
+
+      - name: Generate launcher icons
+        run: |
+          python3 -c "import PIL" 2>/dev/null || pip install --quiet --break-system-packages pillow
+          python3 - << 'PY'
+          from PIL import Image, ImageDraw
+          import os
+
+          sizes = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+
+          def make(sz, rnd):
+              S = sz * 4
+              im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+              d = ImageDraw.Draw(im)
+              bg = (24, 24, 27, 255)
+              if rnd:
+                  d.ellipse((0, 0, S - 1, S - 1), fill=bg)
+              else:
+                  d.rounded_rectangle((0, 0, S - 1, S - 1), radius=int(S * 0.22), fill=bg)
+              c = S / 2
+              for r, col in ((0.40, (235, 235, 240, 255)), (0.32, (0, 0, 0, 255)),
+                             (0.24, (235, 235, 240, 255)), (0.15, (0, 0, 0, 255))):
+                  d.ellipse((c - r * S, c - r * S, c + r * S, c + r * S), fill=col)
+              return im.resize((sz, sz), Image.LANCZOS)
+
+          for name, sz in sizes.items():
+              folder = "app/src/main/res/mipmap-" + name
+              os.makedirs(folder, exist_ok=True)
+              make(sz, False).save(folder + "/ic_launcher.png")
+              make(sz, True).save(folder + "/ic_launcher_round.png")
+          PY
+
+      - name: Gradle wrapper
+        run: gradle wrapper --gradle-version 8.11.1 --no-daemon
+
+      - name: Build release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew clean assembleRelease --no-daemon
+
+      - name: Verify APK signature
+        run: |
+          APK=app/build/outputs/apk/release/app-arm64-v8a-release.apk
+          ls -la app/build/outputs/apk/release/
+          BT=$(ls -d /usr/local/lib/android/sdk/build-tools/* | sort -V | tail -1)
+          "$BT/apksigner" verify --verbose "$APK"
+
+      - name: Bundle output
+        run: |
+          mkdir -p bundle
+          cp app/build/outputs/apk/release/app-arm64-v8a-release.apk bundle/GreyPulse.apk
+          cp -r app/src bundle/source
+          cp .github/workflows/build.yml bundle/build.yml
+          {
+            echo "App: GreyPulse (com.grey.pulse)"
+            echo "Build number: ${BUILD_NUMBER}"
+            echo "Commit: ${GITHUB_SHA}"
+            echo "Built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > bundle/BUILD_INFO.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GreyPulse-${{ github.run_number }}
+          path: bundle
+          retention-days: 30
