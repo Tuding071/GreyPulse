@@ -132,6 +132,10 @@ jobs:
                   compose = true
               }
 
+              androidResources {
+                  noCompress += listOf("onnx")
+              }
+
               lint {
                   checkReleaseBuilds = false
                   abortOnError = false
@@ -160,6 +164,7 @@ jobs:
               implementation("androidx.media3:media3-common:1.8.0")
               implementation("androidx.media3:media3-exoplayer:1.8.0")
               implementation("androidx.media3:media3-session:1.8.0")
+              implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
           }
           EOF
 
@@ -176,6 +181,7 @@ jobs:
 
               <application
                   android:allowBackup="false"
+                  android:largeHeap="true"
                   android:icon="@mipmap/ic_launcher"
                   android:roundIcon="@mipmap/ic_launcher_round"
                   android:label="GreyPulse"
@@ -704,6 +710,611 @@ jobs:
           }
           KOTLIN_EOF
 
+          cat > app/src/main/java/com/grey/pulse/BeatMap.kt << 'KOTLIN_EOF'
+          package com.grey.pulse
+
+          import java.io.BufferedInputStream
+          import java.io.BufferedOutputStream
+          import java.io.DataInputStream
+          import java.io.DataOutputStream
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import kotlin.math.abs
+          import kotlin.math.floor
+          import kotlin.math.ln
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.pow
+          import kotlin.math.sqrt
+
+          /**
+           * What one analysis run saves for one song (a few KB):
+           *  - kickEnv : low-band energy of the DRUMS stem per frame (0..255)
+           *  - bassEnv : low-band energy of the BASS stem per frame  (0..255)
+           *  - events  : kick hits and bar / 8-bar-phrase marks with their exact time in seconds
+           * Frame j covers samples [j*HOP, j*HOP+WIN) of the 44.1 kHz stereo song.
+           */
+          class SongMap(
+              val bpm: Float,
+              val kickEnv: ByteArray,
+              val bassEnv: ByteArray,
+              val evT: FloatArray,
+              val evS: ByteArray,
+              val evK: ByteArray // 0 = kick, 1 = first beat of a bar, 2 = start of an 8-bar phrase
+          ) {
+              companion object {
+                  const val SR = 44100
+                  const val HOP = 1024
+                  const val WIN = 4096
+                  const val FPS = SR.toDouble() / HOP
+                  private const val MAGIC = 0x47504D31 // GPM1
+
+                  fun frameTime(j: Int): Double = (j.toLong() * HOP + WIN / 2).toDouble() / SR
+
+                  fun save(m: SongMap, f: File) {
+                      f.parentFile?.mkdirs()
+                      val tmp = File(f.parentFile, f.name + ".tmp")
+                      DataOutputStream(BufferedOutputStream(FileOutputStream(tmp))).use { o ->
+                          o.writeInt(MAGIC)
+                          o.writeFloat(m.bpm)
+                          o.writeInt(m.kickEnv.size)
+                          o.write(m.kickEnv)
+                          o.write(m.bassEnv)
+                          o.writeInt(m.evT.size)
+                          for (i in m.evT.indices) {
+                              o.writeFloat(m.evT[i])
+                              o.writeByte(m.evS[i].toInt())
+                              o.writeByte(m.evK[i].toInt())
+                          }
+                      }
+                      if (f.exists()) f.delete()
+                      tmp.renameTo(f)
+                  }
+
+                  fun load(f: File): SongMap? {
+                      if (!f.exists()) return null
+                      return try {
+                          DataInputStream(BufferedInputStream(FileInputStream(f))).use { i ->
+                              if (i.readInt() != MAGIC) return null
+                              val bpm = i.readFloat()
+                              val n = i.readInt()
+                              if (n < 0 || n > 5_000_000) return null
+                              val k = ByteArray(n); i.readFully(k)
+                              val b = ByteArray(n); i.readFully(b)
+                              val ne = i.readInt()
+                              if (ne < 0 || ne > 1_000_000) return null
+                              val t = FloatArray(ne)
+                              val s = ByteArray(ne)
+                              val kd = ByteArray(ne)
+                              for (e in 0 until ne) {
+                                  t[e] = i.readFloat()
+                                  s[e] = i.readByte()
+                                  kd[e] = i.readByte()
+                              }
+                              SongMap(bpm, k, b, t, s, kd)
+                          }
+                      } catch (e: Exception) {
+                          null
+                      }
+                  }
+              }
+
+              /** Interpolated 0..1 value of an envelope at time t (seconds). */
+              fun envAt(arr: ByteArray, t: Double): Float {
+                  if (arr.isEmpty()) return 0f
+                  val x = (t * SR - WIN / 2) / HOP
+                  if (x <= 0.0) return (arr[0].toInt() and 255) / 255f
+                  val i0 = floor(x).toInt()
+                  if (i0 >= arr.size - 1) return (arr[arr.size - 1].toInt() and 255) / 255f
+                  val fr = (x - i0).toFloat()
+                  val a = (arr[i0].toInt() and 255) / 255f
+                  val b = (arr[i0 + 1].toInt() and 255) / 255f
+                  return a + (b - a) * fr
+              }
+
+              /** Index of the first event with time > t (binary search). */
+              fun firstAfter(t: Double): Int {
+                  var lo = 0
+                  var hi = evT.size
+                  while (lo < hi) {
+                      val mid = (lo + hi) ushr 1
+                      if (evT[mid] > t) hi = mid else lo = mid + 1
+                  }
+                  return lo
+              }
+          }
+
+          /** Offline beat tracking on the whole song (nothing live, nothing guessed). */
+          object BeatTracker {
+
+              private fun p(sorted: FloatArray, q: Float): Float {
+                  if (sorted.isEmpty()) return 1f
+                  val i = ((sorted.size - 1) * q).toInt().coerceIn(0, sorted.size - 1)
+                  return sorted[i]
+              }
+
+              private fun toBytes(x: FloatArray, n: Int): ByteArray {
+                  val s = x.copyOf(n)
+                  s.sort()
+                  val top = max(p(s, 0.99f), 1e-9f)
+                  return ByteArray(n) { ((x[it] / top).coerceIn(0f, 1f) * 255f + 0.5f).toInt().toByte() }
+              }
+
+              fun build(kick: FloatArray, bass: FloatArray, n: Int): SongMap {
+                  val kb = toBytes(kick, n)
+                  val bb = toBytes(bass, n)
+                  if (n < 200) return SongMap(0f, kb, bb, FloatArray(0), ByteArray(0), ByteArray(0))
+
+                  // normalised, log-compressed kick envelope and its onset strength
+                  var mx = 1e-12
+                  for (i in 0 until n) if (kick[i] > mx) mx = kick[i].toDouble()
+                  val e = DoubleArray(n) { ln(1.0 + 60.0 * kick[it] / mx) }
+                  val o = DoubleArray(n)
+                  for (i in 1 until n) o[i] = max(0.0, e[i] - e[i - 1])
+
+                  // ---- tempo: autocorrelation of onsets, folded into 85..175 BPM, prior around 130
+                  val lo = (SongMap.FPS * 60 / 175).toInt()
+                  val hi = (SongMap.FPS * 60 / 85).toInt()
+                  val ac = DoubleArray(hi + 2)
+                  for (lag in lo..hi) {
+                      var s = 0.0
+                      for (i in lag until n) s += o[i] * o[i - lag]
+                      ac[lag] = s / (n - lag)
+                  }
+                  var best = -1.0
+                  var bestLag = lo
+                  for (lag in lo..hi) {
+                      val bpm = SongMap.FPS * 60 / lag
+                      val w = Math.exp(-0.5 * (ln(bpm / 130.0) / ln(2.0) / 0.6).pow(2))
+                      val v = ac[lag] * w
+                      if (v > best) { best = v; bestLag = lag }
+                  }
+                  var tT = bestLag.toDouble()
+                  if (bestLag in (lo + 1) until hi) {
+                      val a = ac[bestLag - 1]; val b = ac[bestLag]; val c = ac[bestLag + 1]
+                      val d = a - 2 * b + c
+                      if (d != 0.0) tT += (0.5 * (a - c) / d).coerceIn(-0.5, 0.5)
+                  }
+                  val bpm = (SongMap.FPS * 60 / tT).toFloat()
+
+                  // ---- beat grid: dynamic programming (Ellis 2007)
+                  var mean = 0.0
+                  for (v in o) mean += v
+                  mean /= n
+                  var sd = 0.0
+                  for (v in o) sd += (v - mean) * (v - mean)
+                  sd = sqrt(sd / n) + 1e-12
+                  val on = DoubleArray(n) { o[it] / sd }
+                  val c = DoubleArray(n)
+                  val prev = IntArray(n) { -1 }
+                  for (i in 0 until n) {
+                      val jlo = max(0, (i - 2 * tT).toInt())
+                      val jhi = (i - tT / 2).toInt()
+                      var bv = 0.0
+                      var bj = -1
+                      for (j in jlo..jhi) {
+                          if (j < 0 || j >= i) continue
+                          val v = c[j] - 100.0 * ln((i - j) / tT).pow(2)
+                          if (bj < 0 || v > bv) { bv = v; bj = j }
+                      }
+                      if (bj >= 0 && bv > 0) { c[i] = on[i] + bv; prev[i] = bj } else c[i] = on[i]
+                  }
+                  val st = max(0, (n - tT).toInt())
+                  var end = st
+                  for (i in st until n) if (c[i] > c[end]) end = i
+                  val beatsRev = ArrayList<Int>()
+                  var cur = end
+                  while (cur >= 0) { beatsRev.add(cur); cur = prev[cur] }
+                  val beats = beatsRev.reversed()
+
+                  // ---- kick hits: peaks of the onset strength
+                  val os = FloatArray(n) { o[it].toFloat() }
+                  os.sort()
+                  val p95 = max(p(os, 0.95f), 1e-6f)
+                  val ev = ArrayList<Triple<Int, Float, Int>>() // frame, strength 0..1, kind
+                  var lastK = -10
+                  for (i in 2 until n - 2) {
+                      var m = 0.0
+                      val a = max(0, i - 10)
+                      val b = min(n - 1, i + 10)
+                      for (k in a..b) m += o[k]
+                      m /= (b - a + 1)
+                      val thr = m * 1.8 + 0.08 * p95
+                      if (o[i] > thr && o[i] >= o[i - 1] && o[i] > o[i + 1] && i - lastK >= 3) {
+                          val s = (o[i] / p95).coerceIn(0.0, 1.0).toFloat() * 0.7f + 0.3f
+                          ev.add(Triple(i, s, 0))
+                          lastK = i
+                      }
+                  }
+
+                  // ---- bars and phrases: the beat position (0..3) with the strongest kicks is the "1"
+                  if (beats.size >= 8) {
+                      val sum = DoubleArray(4)
+                      val cnt = IntArray(4)
+                      for (k in beats.indices) {
+                          sum[k % 4] += e[beats[k]]
+                          cnt[k % 4]++
+                      }
+                      var down = 0
+                      var bm = -1.0
+                      for (q in 0 until 4) {
+                          val mm = if (cnt[q] > 0) sum[q] / cnt[q] else 0.0
+                          if (mm > bm) { bm = mm; down = q }
+                      }
+                      var bar = 0
+                      var k = down
+                      while (k < beats.size) {
+                          val fr = beats[k]
+                          val kind = if (bar % 8 == 0) 2 else 1
+                          var hit = -1
+                          for (x in ev.indices) if (abs(ev[x].first - fr) <= 3) { hit = x; break }
+                          if (hit >= 0) {
+                              val old = ev[hit]
+                              ev[hit] = Triple(old.first, max(old.second, 0.8f), kind)
+                          } else {
+                              ev.add(Triple(fr, 0.8f, kind))
+                          }
+                          bar++
+                          k += 4
+                      }
+                  }
+                  ev.sortBy { it.first }
+                  val t = FloatArray(ev.size) { SongMap.frameTime(ev[it].first).toFloat() }
+                  val s = ByteArray(ev.size) { (ev[it].second.coerceIn(0f, 1f) * 255f).toInt().toByte() }
+                  val kd = ByteArray(ev.size) { ev[it].third.toByte() }
+                  return SongMap(bpm, kb, bb, t, s, kd)
+              }
+          }
+          KOTLIN_EOF
+
+          cat > app/src/main/java/com/grey/pulse/Stems.kt << 'KOTLIN_EOF'
+          package com.grey.pulse
+
+          import ai.onnxruntime.OnnxTensor
+          import ai.onnxruntime.OrtEnvironment
+          import ai.onnxruntime.OrtSession
+          import android.content.Context
+          import android.media.MediaCodec
+          import android.media.MediaExtractor
+          import android.media.MediaFormat
+          import android.net.Uri
+          import android.os.Process
+          import java.io.File
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import kotlin.math.PI
+          import kotlin.math.cos
+          import kotlin.math.max
+          import kotlin.math.sin
+          import kotlin.math.sqrt
+
+          class Pcm(val l: ShortArray, val r: ShortArray, val n: Int)
+
+          object Decoder {
+              /** Decodes any song the phone can play into 44.1 kHz stereo 16-bit. Returns null if cancelled/failed. */
+              fun decode(ctx: Context, uri: Uri, cancel: () -> Boolean, progress: (Float) -> Unit): Pcm? {
+                  val ex = MediaExtractor()
+                  var codec: MediaCodec? = null
+                  try {
+                      ex.setDataSource(ctx, uri, null)
+                      var idx = -1
+                      var fmt: MediaFormat? = null
+                      for (i in 0 until ex.trackCount) {
+                          val f = ex.getTrackFormat(i)
+                          if ((f.getString(MediaFormat.KEY_MIME) ?: "").startsWith("audio/")) { idx = i; fmt = f; break }
+                      }
+                      if (idx < 0 || fmt == null) return null
+                      ex.selectTrack(idx)
+                      val mime = fmt.getString(MediaFormat.KEY_MIME) ?: return null
+                      val durUs = if (fmt.containsKey(MediaFormat.KEY_DURATION)) fmt.getLong(MediaFormat.KEY_DURATION) else 0L
+                      codec = MediaCodec.createDecoderByType(mime)
+                      codec.configure(fmt, null, null, 0)
+                      codec.start()
+
+                      var sr = if (fmt.containsKey(MediaFormat.KEY_SAMPLE_RATE)) fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 44100
+                      var ch = if (fmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
+                      var isFloat = false
+                      var cap = max(1 shl 20, ((durUs / 1_000_000.0 + 2.0) * sr).toInt())
+                      var l = ShortArray(cap)
+                      var r = ShortArray(cap)
+                      var n = 0
+
+                      val info = MediaCodec.BufferInfo()
+                      var inDone = false
+                      var outDone = false
+                      while (!outDone) {
+                          if (cancel()) return null
+                          if (!inDone) {
+                              val ib = codec.dequeueInputBuffer(5000)
+                              if (ib >= 0) {
+                                  val buf = codec.getInputBuffer(ib)!!
+                                  val sz = ex.readSampleData(buf, 0)
+                                  if (sz < 0) {
+                                      codec.queueInputBuffer(ib, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                      inDone = true
+                                  } else {
+                                      codec.queueInputBuffer(ib, 0, sz, ex.sampleTime, 0)
+                                      ex.advance()
+                                  }
+                              }
+                          }
+                          val ob = codec.dequeueOutputBuffer(info, 5000)
+                          if (ob >= 0) {
+                              val out = codec.getOutputBuffer(ob)!!
+                              out.position(info.offset)
+                              out.limit(info.offset + info.size)
+                              out.order(ByteOrder.LITTLE_ENDIAN)
+                              val frames = if (isFloat) info.size / (4 * ch) else info.size / (2 * ch)
+                              if (n + frames > l.size) {
+                                  val nc = max(l.size * 2, n + frames + 4096)
+                                  l = l.copyOf(nc); r = r.copyOf(nc)
+                              }
+                              if (isFloat) {
+                                  val fb = out.asFloatBuffer()
+                                  for (i in 0 until frames) {
+                                      val a = fb.get(i * ch)
+                                      val b = if (ch > 1) fb.get(i * ch + 1) else a
+                                      l[n] = (a * 32767f).coerceIn(-32768f, 32767f).toInt().toShort()
+                                      r[n] = (b * 32767f).coerceIn(-32768f, 32767f).toInt().toShort()
+                                      n++
+                                  }
+                              } else {
+                                  val sb = out.asShortBuffer()
+                                  for (i in 0 until frames) {
+                                      val a = sb.get(i * ch)
+                                      l[n] = a
+                                      r[n] = if (ch > 1) sb.get(i * ch + 1) else a
+                                      n++
+                                  }
+                              }
+                              if (durUs > 0) progress((info.presentationTimeUs.toFloat() / durUs).coerceIn(0f, 1f))
+                              codec.releaseOutputBuffer(ob, false)
+                              if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outDone = true
+                          } else if (ob == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                              val nf = codec.outputFormat
+                              if (nf.containsKey(MediaFormat.KEY_SAMPLE_RATE)) sr = nf.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                              if (nf.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) ch = nf.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                              isFloat = nf.containsKey(MediaFormat.KEY_PCM_ENCODING) &&
+                                  nf.getInteger(MediaFormat.KEY_PCM_ENCODING) == 4 // AudioFormat.ENCODING_PCM_FLOAT
+                          }
+                      }
+                      if (n < 4096) return null
+                      if (sr == SongMap.SR) return Pcm(l, r, n)
+
+                      // linear resample to 44.1 kHz
+                      val m = (n.toLong() * SongMap.SR / sr).toInt()
+                      val l2 = ShortArray(m)
+                      val r2 = ShortArray(m)
+                      val step = sr.toDouble() / SongMap.SR
+                      for (i in 0 until m) {
+                          val p = i * step
+                          val i0 = p.toInt()
+                          val i1 = if (i0 + 1 < n) i0 + 1 else i0
+                          val fr = (p - i0).toFloat()
+                          l2[i] = (l[i0] + (l[i1] - l[i0]) * fr).toInt().toShort()
+                          r2[i] = (r[i0] + (r[i1] - r[i0]) * fr).toInt().toShort()
+                      }
+                      return Pcm(l2, r2, m)
+                  } catch (e: Exception) {
+                      return null
+                  } finally {
+                      try { codec?.stop() } catch (e: Exception) { }
+                      try { codec?.release() } catch (e: Exception) { }
+                      try { ex.release() } catch (e: Exception) { }
+                  }
+              }
+          }
+
+          class Fft(val n: Int) {
+              private val cosT = FloatArray(n / 2) { cos(2.0 * PI * it / n).toFloat() }
+              private val sinT = FloatArray(n / 2) { (-sin(2.0 * PI * it / n)).toFloat() }
+              private val rev = IntArray(n)
+
+              init {
+                  var bits = 0
+                  while ((1 shl bits) < n) bits++
+                  for (i in 0 until n) rev[i] = (rev[i shr 1] shr 1) or ((i and 1) shl (bits - 1))
+              }
+
+              fun fft(re: FloatArray, im: FloatArray) {
+                  for (i in 0 until n) {
+                      val j = rev[i]
+                      if (j > i) {
+                          val tr = re[i]; re[i] = re[j]; re[j] = tr
+                          val ti = im[i]; im[i] = im[j]; im[j] = ti
+                      }
+                  }
+                  var size = 2
+                  while (size <= n) {
+                      val half = size / 2
+                      val step = n / size
+                      var i = 0
+                      while (i < n) {
+                          var k = 0
+                          for (j in i until i + half) {
+                              val wr = cosT[k]
+                              val wi = sinT[k]
+                              val xr = re[j + half] * wr - im[j + half] * wi
+                              val xi = re[j + half] * wi + im[j + half] * wr
+                              re[j + half] = re[j] - xr
+                              im[j + half] = im[j] - xi
+                              re[j] += xr
+                              im[j] += xi
+                              k += step
+                          }
+                          i += size
+                      }
+                      size *= 2
+                  }
+              }
+          }
+
+          /**
+           * Splits a song with the Spleeter U-Net models (drums + bass only, run on the phone with
+           * ONNX Runtime), but never builds audio: it just reads the low-frequency energy of each stem
+           * and hands it to BeatTracker. Model files live in the app assets (downloaded during the build).
+           */
+          class Analyzer(private val ctx: Context) {
+
+              @Volatile var cancel = false
+              @Volatile var lastError = ""
+
+              companion object {
+                  private const val BINS = 1024
+                  private const val CHUNK = 512
+                  private const val KICK_LO = 1
+                  private const val KICK_HI = 11   // bins 1..11  = ~11..118 Hz
+                  private const val BASS_LO = 1
+                  private const val BASS_HI = 8    // bins 1..8   = ~11..97 Hz
+              }
+
+              private var env: OrtEnvironment? = null
+              private var drums: OrtSession? = null
+              private var bass: OrtSession? = null
+
+              private fun modelFile(name: String): File {
+                  val dir = File(ctx.filesDir, "models")
+                  dir.mkdirs()
+                  val f = File(dir, name)
+                  if (!f.exists() || f.length() < 1_000_000L) {
+                      ctx.assets.open(name).use { i -> f.outputStream().use { o -> i.copyTo(o) } }
+                  }
+                  return f
+              }
+
+              private fun ensureSessions() {
+                  if (drums != null && bass != null) return
+                  val e = OrtEnvironment.getEnvironment()
+                  env = e
+                  val o1 = OrtSession.SessionOptions()
+                  o1.setIntraOpNumThreads(2)
+                  val o2 = OrtSession.SessionOptions()
+                  o2.setIntraOpNumThreads(2)
+                  drums = e.createSession(modelFile("drums.onnx").absolutePath, o1)
+                  bass = e.createSession(modelFile("bass.onnx").absolutePath, o2)
+              }
+
+              fun close() {
+                  try { drums?.close() } catch (e: Exception) { }
+                  try { bass?.close() } catch (e: Exception) { }
+                  drums = null
+                  bass = null
+              }
+
+              /** Returns the song map, or null when cancelled / failed (see lastError). progress = 0..1 */
+              fun analyze(uri: Uri, progress: (Float) -> Unit): SongMap? {
+                  cancel = false
+                  lastError = ""
+                  try {
+                      Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+                      val pcm = Decoder.decode(ctx, uri, { cancel }) { progress(it * 0.08f) }
+                      if (pcm == null) {
+                          if (!cancel) lastError = "Could not decode this file"
+                          return null
+                      }
+                      ensureSessions()
+                      val e = env!!
+                      val sd = drums!!
+                      val sb = bass!!
+                      val nameD = sd.inputNames.first()
+                      val nameB = sb.inputNames.first()
+
+                      val n = pcm.n
+                      val frames = if (n <= SongMap.WIN) 1 else (n - SongMap.WIN + SongMap.HOP - 1) / SongMap.HOP + 1
+                      val splits = (frames + CHUNK - 1) / CHUNK
+                      val kick = FloatArray(frames)
+                      val bassE = FloatArray(frames)
+
+                      val win = FloatArray(SongMap.WIN) { (0.5 - 0.5 * cos(2.0 * PI * it / SongMap.WIN)).toFloat() }
+                      val fft = Fft(SongMap.WIN)
+                      val re = FloatArray(SongMap.WIN)
+                      val im = FloatArray(SongMap.WIN)
+                      val bb = ByteBuffer.allocateDirect(2 * CHUNK * BINS * 4).order(ByteOrder.nativeOrder())
+                      val buf = bb.asFloatBuffer()
+                      val shape = longArrayOf(2, 1, CHUNK.toLong(), BINS.toLong())
+                      val inv = 1f / 32768f
+                      val N = SongMap.WIN
+
+                      for (s in 0 until splits) {
+                          if (cancel) return null
+                          for (f in 0 until CHUNK) {
+                              val j = s * CHUNK + f
+                              val baseL = f * BINS
+                              val baseR = CHUNK * BINS + f * BINS
+                              if (j >= frames) {
+                                  for (b in 0 until BINS) { buf.put(baseL + b, 0f); buf.put(baseR + b, 0f) }
+                                  continue
+                              }
+                              val start = j * SongMap.HOP
+                              for (i in 0 until N) {
+                                  val p = start + i
+                                  if (p < n) {
+                                      re[i] = pcm.l[p] * inv * win[i]
+                                      im[i] = pcm.r[p] * inv * win[i]
+                                  } else {
+                                      re[i] = 0f; im[i] = 0f
+                                  }
+                              }
+                              fft.fft(re, im)
+                              for (k in 0 until BINS) {
+                                  val k2 = (N - k) and (N - 1)
+                                  val lr = (re[k] + re[k2]) * 0.5f
+                                  val li = (im[k] - im[k2]) * 0.5f
+                                  val rr = (im[k] + im[k2]) * 0.5f
+                                  val ri = (re[k2] - re[k]) * 0.5f
+                                  buf.put(baseL + k, sqrt(lr * lr + li * li))
+                                  buf.put(baseR + k, sqrt(rr * rr + ri * ri))
+                              }
+                          }
+                          buf.rewind()
+                          val tensor = OnnxTensor.createTensor(e, buf, shape)
+                          try {
+                              sd.run(mapOf(nameD to tensor)).use { res ->
+                                  val out = (res.get(0) as OnnxTensor).floatBuffer
+                                  for (f in 0 until CHUNK) {
+                                      val j = s * CHUNK + f
+                                      if (j >= frames) break
+                                      var a = 0f
+                                      for (c in 0 until 2) {
+                                          val b0 = c * CHUNK * BINS + f * BINS
+                                          for (k in KICK_LO..KICK_HI) a += out.get(b0 + k)
+                                      }
+                                      kick[j] = a * 0.5f
+                                  }
+                              }
+                              if (cancel) return null
+                              sb.run(mapOf(nameB to tensor)).use { res ->
+                                  val out = (res.get(0) as OnnxTensor).floatBuffer
+                                  for (f in 0 until CHUNK) {
+                                      val j = s * CHUNK + f
+                                      if (j >= frames) break
+                                      var a = 0f
+                                      for (c in 0 until 2) {
+                                          val b0 = c * CHUNK * BINS + f * BINS
+                                          for (k in BASS_LO..BASS_HI) a += out.get(b0 + k)
+                                      }
+                                      bassE[j] = a * 0.5f
+                                  }
+                              }
+                          } finally {
+                              tensor.close()
+                          }
+                          progress(0.08f + 0.9f * (s + 1) / splits)
+                      }
+                      val map = BeatTracker.build(kick, bassE, frames)
+                      progress(1f)
+                      return map
+                  } catch (t: Throwable) {
+                      lastError = (t.message ?: t.javaClass.simpleName).take(120)
+                      return null
+                  } finally {
+                      Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT)
+                  }
+              }
+          }
+          KOTLIN_EOF
+
           cat > app/src/main/java/com/grey/pulse/PlaybackService.kt << 'KOTLIN_EOF'
           package com.grey.pulse
 
@@ -779,7 +1390,6 @@ jobs:
           import android.graphics.Canvas
           import android.graphics.Color
           import android.graphics.Paint
-          import android.graphics.Path
           import android.view.View
           import kotlin.math.cos
           import kotlin.math.exp
@@ -791,30 +1401,37 @@ jobs:
           import kotlin.math.sqrt
           import kotlin.random.Random
 
+          interface VizSource {
+              /** Player position in seconds right now (not yet corrected for speaker delay). */
+              fun posSec(): Double
+              /** Saved analysis of the song that is playing, or null if it has none yet. */
+              fun map(): SongMap?
+              /** Changes when the song changes. */
+              fun key(): String
+          }
+
           /**
-           * Center: two flares (top = low end of the bass range, bottom = high end) in 4 overlapping
-           * layers black / white / black / white. Each layer reacts LAYER_STEP_MS later than the one
-           * inside it, so the outer layers trail like a tail.
-           * Mid range (default 1-4 kHz) makes the whole disc rock / wander randomly.
-           * Beats make the disc pop bigger and kick the particles away from the center.
-           * Bass makes the particles rumble in/out along their own path (subwoofer-port feel).
-           * Everything is tweakable in menu > Visualizer (see Cfg).
+           * Trap-Nation style center, inside -> outside:
+           *   black disc (thumps bigger on every kick) / white glowing ring / black gap / white glowing radial bars.
+           * Bars show the bass range (top = low Hz end, bottom = high Hz end, mirrored left/right) and trail:
+           * two older copies (100 ms and 200 ms ago) are drawn dimmer behind the live one.
+           * Kicks, bars and 8-bar phrases come from the saved stem analysis (exact times) when the song
+           * has one, otherwise from the live detector. Mid range (default 1-4 kHz) makes the center wander.
+           * Kicks also scatter the particles; the bass makes them rumble.
            */
           class VisualizerView(ctx: Context) : View(ctx) {
 
               @JvmField var playing = false
+              @JvmField var source: VizSource? = null
 
               companion object {
                   const val CONTRAST = 2.0f
                   const val ATTACK = 28f
                   const val DECAY = 5f
-                  const val LAYER_STEP_MS = 100          // delay between layers (the "tail")
+                  const val TAIL_MS = 100
                   const val HIST = 128
                   const val MAXP = 600
-                  const val POINTS = 160
-                  val BASE_R = floatArrayOf(0.28f, 0.36f, 0.44f, 0.52f) // inner -> outer (x u)
-                  val FLARE = floatArrayOf(0.12f, 0.18f, 0.22f, 0.26f)
-                  val WHITE = booleanArrayOf(false, true, false, true)  // black, white, black, white
+                  const val BARS = 96
                   val PIF = Math.PI.toFloat()
               }
 
@@ -833,19 +1450,18 @@ jobs:
               private var midPrev = 0f
               private val dens = ctx.resources.displayMetrics.density
 
-              // rocking motion
+              // wandering (no tilt)
               private var mx = 0f
               private var my = 0f
               private var mvx = 0f
               private var mvy = 0f
-              private var mr = 0f
-              private var mvr = 0f
               private var ox = 0f
               private var oy = 0f
-              private var rot = 0f
 
               // beats
               private var pop = 0f
+              private var kickBody = 0f
+              private var bassBody = 0f
               private var pendingScatter = 0f
               private var lastSeen = AudioBus.beatHead
               private val pendNs = LongArray(16)
@@ -853,20 +1469,21 @@ jobs:
               private val pendK = IntArray(16)
               private var pendN = 0
 
-              // geometry
+              // saved-map playback
+              private var curMap: SongMap? = null
+              private var curKey = ""
+              private var lastPos = -1.0
+              private var evIdx = 0
+              @JvmField var usingMap = false
+
               private var cx = 0f
               private var cy = 0f
               private var uu = 1f
 
-              private val path = Path()
-              private val fillWhite = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  color = Color.argb(238, 255, 255, 255); style = Paint.Style.FILL
-              }
-              private val fillBlack = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  color = Color.BLACK; style = Paint.Style.FILL
-              }
-              private val glow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  style = Paint.Style.STROKE; strokeJoin = Paint.Join.ROUND
+              private val fillBlack = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK; style = Paint.Style.FILL }
+              private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; color = Color.WHITE }
+              private val bar = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE; color = Color.WHITE; strokeCap = Paint.Cap.ROUND
               }
               private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
 
@@ -877,8 +1494,8 @@ jobs:
               private val pph = FloatArray(MAXP) { Random.nextFloat() * 6.28f }
               private val ptw = FloatArray(MAXP) { Random.nextFloat() * 1.2f + 0.4f }
               private val pjit = FloatArray(MAXP) { Random.nextFloat() }
-              private val sc = FloatArray(MAXP)   // scatter offset (px, along the line from the center)
-              private val sv = FloatArray(MAXP)   // scatter velocity
+              private val sc = FloatArray(MAXP)
+              private val sv = FloatArray(MAXP)
 
               override fun onDraw(canvas: Canvas) {
                   val w = width.toFloat()
@@ -896,7 +1513,7 @@ jobs:
                   processBeats(now, dt)
                   updateMotion(dt)
                   drawParticles(canvas, w, h, dt)
-                  drawRings(canvas)
+                  drawCenter(canvas)
                   postInvalidateOnAnimation()
               }
 
@@ -915,7 +1532,6 @@ jobs:
                   }
                   energy = sum / nb
 
-                  // mid: look at the change versus a slow baseline so it moves with the music, not constantly
                   val midRaw = if (fresh) AudioBus.mid else 0f
                   midBase += (midRaw - midBase) * min(1f, dt / 4f)
                   val m = if (fresh) (((midRaw - midBase) * 4f + 0.3f) * Cfg.midSens).coerceIn(0f, 1.2f) else 0f
@@ -928,7 +1544,6 @@ jobs:
                   if (hCount < HIST) hCount++
               }
 
-              /** Index of the newest history frame that is not newer than tTarget (seconds). */
               private fun idxAt(tTarget: Float): Int {
                   var i = head
                   var n = 0
@@ -942,6 +1557,44 @@ jobs:
 
               // ------------------------------------------------------------ beats
               private fun processBeats(now: Long, dt: Float) {
+                  val src = source
+                  val m = src?.map()
+                  usingMap = m != null
+                  if (src != null && m != null) {
+                      mapBeats(src, m)
+                  } else {
+                      liveBeats(now)
+                      kickBody *= exp(-dt * 8f)
+                      bassBody *= exp(-dt * 8f)
+                  }
+                  pop *= exp(-dt * 6.5f)
+              }
+
+              private fun mapBeats(src: VizSource, m: SongMap) {
+                  val key = src.key()
+                  if (m !== curMap || key != curKey) {
+                      curMap = m; curKey = key; lastPos = -1.0
+                  }
+                  // keep the live queue empty so it doesn't fire later
+                  lastSeen = AudioBus.beatHead
+                  pendN = 0
+                  val pos = src.posSec() - Cfg.syncMs / 1000.0
+                  kickBody = m.envAt(m.kickEnv, pos)
+                  bassBody = m.envAt(m.bassEnv, pos)
+                  if (!playing) { lastPos = -1.0; return } // resync on resume / after a seek while paused
+                  if (lastPos < 0.0 || pos < lastPos - 0.05 || pos > lastPos + 0.5) {
+                      lastPos = pos
+                      evIdx = m.firstAfter(pos)
+                      return
+                  }
+                  while (evIdx < m.evT.size && m.evT[evIdx] <= pos) {
+                      fireBeat((m.evS[evIdx].toInt() and 255) / 255f, m.evK[evIdx].toInt())
+                      evIdx++
+                  }
+                  lastPos = pos
+              }
+
+              private fun liveBeats(now: Long) {
                   val headNow = AudioBus.beatHead
                   if (headNow != lastSeen) {
                       var i = max(lastSeen, headNow - AudioBus.QN)
@@ -970,21 +1623,20 @@ jobs:
                           j++
                       }
                   }
-                  pop *= exp(-dt * 6.5f)
               }
 
               private fun fireBeat(str: Float, kind: Int) {
                   val mult = when (kind) {
-                      1 -> 1.5f
-                      2 -> 2.1f
+                      1 -> 1.45f
+                      2 -> 2.0f
                       else -> 1f
                   }
                   val v = str * mult
                   if (v > pop) pop = v
-                  pendingScatter += v * Cfg.scatter
+                  pendingScatter += v * Cfg.scatter * (if (kind == 0) 0.7f else 1f)
               }
 
-              // ------------------------------------------------------------ rocking motion
+              // ------------------------------------------------------------ wandering motion (no tilt)
               private fun updateMotion(dt: Float) {
                   val mLvl = hMid[idxAt(time - Cfg.syncMs / 1000f)]
                   val dm = mLvl - midPrev
@@ -995,23 +1647,17 @@ jobs:
                       val mag = dm * mv
                       mvx += cos(ang) * mag * 2.8f * uu
                       mvy += sin(ang) * mag * 2.8f * uu
-                      mvr += (Random.nextFloat() - 0.5f) * mag * 8f
                   }
                   mvx += (-12f * mx - 4.5f * mvx) * dt
                   mvy += (-12f * my - 4.5f * mvy) * dt
-                  mvr += (-10f * mr - 4f * mvr) * dt
                   mx = (mx + mvx * dt).coerceIn(-0.25f * uu, 0.25f * uu)
                   my = (my + mvy * dt).coerceIn(-0.25f * uu, 0.25f * uu)
-                  mr = (mr + mvr * dt).coerceIn(-0.5f, 0.5f)
 
-                  // slow random drift on top (sums of unrelated sines), scaled by mid loudness
                   val wx = (sin(time * 0.61f + 1.3f) + 0.6f * sin(time * 1.07f + 4.2f)) * 0.5f
                   val wy = (sin(time * 0.53f + 2.1f) + 0.6f * sin(time * 0.91f + 0.4f)) * 0.5f
-                  val wr = sin(time * 0.43f + 0.7f)
                   val amp = mLvl * mv
                   ox = mx + wx * uu * 0.10f * amp
                   oy = my + wy * uu * 0.10f * amp
-                  rot = mr + wr * 0.25f * amp
               }
 
               // ------------------------------------------------------------ particles
@@ -1023,14 +1669,15 @@ jobs:
                   var be = 0f
                   for (i in 0 until nb) be += hh[i]
                   be /= nb
+                  if (usingMap) be = max(be, bassBody * 0.8f)
                   val rum = Cfg.pRumble * be * 2.2f
                   val sizeMul = Cfg.pSize
 
                   for (i in 0 until n) {
                       val bx = px[i] * w + sin(time * pspd[i] + pph[i]) * 14f * dens
                       val by = py[i] * h + cos(time * pspd[i] * 0.8f + pph[i]) * 18f * dens
-                      val dx = bx - cx
-                      val dy = by - cy
+                      val dx = bx - (cx + ox)
+                      val dy = by - (cy + oy)
                       val dist = sqrt(dx * dx + dy * dy) + 1f
                       val ux = dx / dist
                       val uy = dy / dist
@@ -1058,46 +1705,66 @@ jobs:
                   }
               }
 
-              // ------------------------------------------------------------ rings
-              private fun drawRings(canvas: Canvas) {
+              // ------------------------------------------------------------ center
+              private fun barLevel(hh: FloatArray, a: Float, k: Int): Float {
+                  val t = 0.5f + 0.5f * cos(a)          // 0 at the top (low Hz) .. 1 at the bottom (high Hz)
+                  val bp = t * (nb - 1)
+                  val i0 = min(floor(bp).toInt(), nb - 2)
+                  val fr = bp - i0
+                  val s = fr * fr * (3f - 2f * fr)
+                  val v = hh[i0] + (hh[i0 + 1] - hh[i0]) * s
+                  val jit = 0.86f + 0.14f * sin(k * 12.9898f + time * 3.1f)
+                  return v * jit
+              }
+
+              private fun drawCenter(canvas: Canvas) {
                   val ccx = cx + ox
                   val ccy = cy + oy
-                  val scale = 1f + (0.16f * pop * Cfg.popStrength).coerceAtMost(0.5f)
-                  val pulse = 1f + 0.04f * energy
-                  val glowGain = 0.6f + 0.8f * energy + 0.5f * pop
+                  val scale = 1f + (0.16f * pop * Cfg.popStrength).coerceAtMost(0.5f) + 0.03f * kickBody
+                  val r0 = uu * 0.30f * scale
+                  val gain = 0.75f + 0.7f * (if (usingMap) bassBody else energy)
+                  val glowGain = 0.6f + 0.8f * energy + 0.7f * pop + 0.5f * kickBody
 
-                  for (l in 3 downTo 0) {
-                      val hh = hist[idxAt(time - (Cfg.syncMs + l * LAYER_STEP_MS) / 1000f)]
-                      path.reset()
-                      for (k in 0 until POINTS) {
-                          val a = (k.toFloat() / POINTS) * 2f * PIF
-                          // a = 0 is the bottom, a = PI is the top. t = 0 at the top (low Hz), 1 at the bottom (high Hz)
-                          val t = 0.5f + 0.5f * cos(a - rot)
-                          val bp = t * (nb - 1)
-                          val i0 = min(floor(bp).toInt(), nb - 2)
-                          val fr = bp - i0
-                          val s = fr * fr * (3f - 2f * fr)
-                          val v = hh[i0] + (hh[i0 + 1] - hh[i0]) * s
-                          val wob = 0.014f * sin(5f * a + time * 0.9f + l.toFloat()) +
-                              0.009f * sin(3f * a - time * 0.6f)
-                          val r = uu * scale * (BASE_R[l] * pulse + FLARE[l] * v + wob * 0.6f)
-                          val x = ccx + r * sin(a)
-                          val y = ccy + r * cos(a)
-                          if (k == 0) path.moveTo(x, y) else path.lineTo(x, y)
-                      }
-                      path.close()
-                      if (WHITE[l]) {
-                          for (g in 0..2) {
-                              glow.color = Color.WHITE
-                              glow.alpha = ((46 - g * 13) * glowGain).toInt().coerceIn(0, 255)
-                              glow.strokeWidth = (8f + g * 12f) * dens
-                              canvas.drawPath(path, glow)
+                  // black gap behind everything of the center, so the bars float on pure black
+                  canvas.drawCircle(ccx, ccy, r0 * 1.27f, fillBlack)
+
+                  // radial bars, oldest echo first
+                  for (d in 2 downTo 0) {
+                      val hh = hist[idxAt(time - (Cfg.syncMs + d * TAIL_MS) / 1000f)]
+                      val alpha = when (d) { 2 -> 0.22f; 1 -> 0.45f; else -> 1f }
+                      val w = (2.4f * dens) * (if (d == 0) 1f else 0.8f)
+                      val rb = r0 * 1.32f
+                      for (k in 0 until BARS) {
+                          val a = k.toFloat() / BARS * 2f * PIF
+                          val v = barLevel(hh, a, k).coerceIn(0f, 1.3f) * gain
+                          val len = uu * (0.025f + 0.30f * v) * (1f + 0.25f * pop)
+                          val sx = ccx + rb * sin(a)
+                          val sy = ccy + rb * cos(a)
+                          val ex = ccx + (rb + len) * sin(a)
+                          val ey = ccy + (rb + len) * cos(a)
+                          if (d == 0) {
+                              bar.strokeWidth = w * 3.2f
+                              bar.alpha = (28f * glowGain).toInt().coerceIn(0, 255)
+                              canvas.drawLine(sx, sy, ex, ey, bar)
                           }
-                          canvas.drawPath(path, fillWhite)
-                      } else {
-                          canvas.drawPath(path, fillBlack)
+                          bar.strokeWidth = w
+                          bar.alpha = (235f * alpha).toInt()
+                          canvas.drawLine(sx, sy, ex, ey, bar)
                       }
                   }
+
+                  // white glowing ring
+                  for (g in 0..2) {
+                      ring.strokeWidth = (5f + g * 9f) * dens
+                      ring.alpha = ((52 - g * 15) * glowGain).toInt().coerceIn(0, 255)
+                      canvas.drawCircle(ccx, ccy, r0 * 1.12f, ring)
+                  }
+                  ring.strokeWidth = 2.6f * dens
+                  ring.alpha = 240
+                  canvas.drawCircle(ccx, ccy, r0 * 1.12f, ring)
+
+                  // black center disc
+                  canvas.drawCircle(ccx, ccy, r0, fillBlack)
               }
           }
           KOTLIN_EOF
@@ -1215,6 +1882,10 @@ jobs:
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
           import kotlin.math.roundToInt
+          import java.io.File
+          import java.util.concurrent.ConcurrentHashMap
+          import java.util.concurrent.ConcurrentLinkedDeque
+          import kotlinx.coroutines.Job
 
           // ---------------------------------------------------------------- colors
           private val CText = Color(0xFFF5F5F7)
@@ -1341,6 +2012,10 @@ jobs:
                   val d = c.duration
                   durMs = if (d != C.TIME_UNSET && d > 0) d else (mi?.mediaMetadata?.durationMs ?: 0L)
                   posMs = c.currentPosition
+                  if (nowId != lastEnq) {
+                      lastEnq = nowId
+                      nowId.toLongOrNull()?.let { enqueue(it, true) }
+                  }
               }
 
               fun pollPos() {
@@ -1431,6 +2106,91 @@ jobs:
                       val r = withContext(Dispatchers.IO) { scanTracks(app) }
                       tracks = r
                       if (manual) Toast.makeText(app, "Found " + r.size + " songs", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              // ---- stem analysis: once per song, result saved in app storage
+              private val maps = ConcurrentHashMap<Long, SongMap>()
+              private val checked = ConcurrentHashMap.newKeySet<Long>()
+              private val skipped = ConcurrentHashMap.newKeySet<Long>()
+              private val queue = ConcurrentLinkedDeque<Long>()
+              private var worker: Job? = null
+              private var analyzer: Analyzer? = null
+              private var lastEnq = ""
+              var anaActive by mutableStateOf(false)
+              var anaTitle by mutableStateOf("")
+              var anaProgress by mutableStateOf(0f)
+              var anaQueued by mutableStateOf(0)
+
+              private fun mapFile(id: Long) = File(app.filesDir, "maps/" + id + ".gpm")
+
+              fun mapFor(idStr: String): SongMap? {
+                  val id = idStr.toLongOrNull() ?: return null
+                  maps[id]?.let { return it }
+                  if (!checked.add(id)) return null
+                  val m = SongMap.load(mapFile(id))
+                  if (m != null) maps[id] = m
+                  return m
+              }
+
+              private fun hasMap(id: Long) = maps.containsKey(id) || mapFile(id).exists()
+
+              fun enqueue(id: Long, front: Boolean) {
+                  if (id in skipped || queue.contains(id) || hasMap(id)) return
+                  if (front) queue.addFirst(id) else queue.addLast(id)
+                  anaQueued = queue.size
+                  startWorker()
+              }
+
+              fun analyzeAll() {
+                  skipped.clear()
+                  for (t in tracks) enqueue(t.id, false)
+                  if (queue.isEmpty() && !anaActive) Toast.makeText(app, "All songs are already analyzed", Toast.LENGTH_SHORT).show()
+              }
+
+              fun skipCurrent() { analyzer?.cancel = true }
+
+              fun stopAll() {
+                  queue.clear()
+                  anaQueued = 0
+                  analyzer?.cancel = true
+              }
+
+              private fun startWorker() {
+                  if (worker?.isActive == true) return
+                  worker = scope.launch(Dispatchers.Default) {
+                      val an = Analyzer(app)
+                      analyzer = an
+                      try {
+                          while (true) {
+                              val id = queue.pollFirst() ?: break
+                              anaQueued = queue.size
+                              val tr = tracks.firstOrNull { it.id == id } ?: continue
+                              if (hasMap(id)) continue
+                              anaTitle = tr.title
+                              anaProgress = 0f
+                              anaActive = true
+                              val m = an.analyze(tr.uri) { anaProgress = it }
+                              if (m != null) {
+                                  SongMap.save(m, mapFile(id))
+                                  maps[id] = m
+                              } else {
+                                  skipped.add(id)
+                                  if (!an.cancel && an.lastError.isNotEmpty()) {
+                                      val msg = an.lastError
+                                      queue.clear() // a model problem would repeat for every song
+                                      withContext(Dispatchers.Main) {
+                                          Toast.makeText(app, "Analysis failed: " + msg, Toast.LENGTH_LONG).show()
+                                      }
+                                  }
+                              }
+                          }
+                      } finally {
+                          an.close()
+                          analyzer = null
+                          anaActive = false
+                          anaQueued = 0
+                      }
                   }
               }
 
@@ -1644,9 +2404,16 @@ jobs:
                       .fillMaxSize()
                       .background(Brush.verticalGradient(listOf(Color(0xFF18181B), Color(0xFF0E0E10))))
               ) {
+                  val vizSource = remember {
+                      object : VizSource {
+                          override fun posSec(): Double = (vm.controller?.currentPosition ?: 0L) / 1000.0
+                          override fun map(): SongMap? = vm.mapFor(vm.nowId)
+                          override fun key(): String = vm.nowId
+                      }
+                  }
                   AndroidView(
                       factory = { VisualizerView(it) },
-                      update = { it.playing = vm.isPlaying },
+                      update = { it.playing = vm.isPlaying; it.source = vizSource },
                       modifier = Modifier.fillMaxSize()
                   )
 
@@ -1665,6 +2432,7 @@ jobs:
                               MenuPanel(
                                   onEq = { panel = Panel.Eq },
                                   onViz = { panel = Panel.Viz },
+                                  onAna = { panel = Panel.None; vm.analyzeAll() },
                                   onScan = { panel = Panel.None; requestAndScan(true) }
                               )
                           }
@@ -1675,6 +2443,7 @@ jobs:
                               EqPanel(vm) { idx -> pendingDelete = idx }
                           }
                       }
+                      if (vm.anaActive) AnalysisBar(vm)
                       Controls(vm)
                   }
 
@@ -1787,8 +2556,9 @@ jobs:
 
           // ---------------------------------------------------------------- menu
           @Composable
-          fun MenuPanel(onEq: () -> Unit, onViz: () -> Unit, onScan: () -> Unit) {
+          fun MenuPanel(onEq: () -> Unit, onViz: () -> Unit, onAna: () -> Unit, onScan: () -> Unit) {
               Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                  MenuRow("Analyze all songs", "Find kicks and beats once per song", onAna) { IconViz() }
                   MenuRow("Equalizer", "Add bands and shape the sound", onEq) { IconEq() }
                   MenuRow("Visualizer", "Bass, motion, beat and particles", onViz) { IconViz() }
                   MenuRow("Scan Files", "Find songs on this device", onScan) { IconScan() }
@@ -2206,6 +2976,53 @@ jobs:
               }
           }
 
+          // ---------------------------------------------------------------- analysis bar
+          @Composable
+          fun AnalysisBar(vm: PlayerVm) {
+              Row(
+                  Modifier
+                      .fillMaxWidth()
+                      .padding(horizontal = 18.dp, vertical = 6.dp)
+                      .clip(RoundedCornerShape(14.dp))
+                      .background(Color(0xCC1E1E23))
+                      .border(1.dp, Color(0x14FFFFFF), RoundedCornerShape(14.dp))
+                      .padding(start = 14.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Column(Modifier.weight(1f)) {
+                      Text(
+                          "Analyzing: " + vm.anaTitle, color = CText, fontSize = 12.sp,
+                          fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis
+                      )
+                      Box(Modifier.height(5.dp))
+                      Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(99.dp)).background(CSurf3)) {
+                          Box(
+                              Modifier.fillMaxWidth(vm.anaProgress.coerceIn(0f, 1f)).height(4.dp)
+                                  .clip(RoundedCornerShape(99.dp)).background(Color(0xCCFFFFFF))
+                          )
+                      }
+                      Box(Modifier.height(4.dp))
+                      val more = if (vm.anaQueued > 0) "  +" + vm.anaQueued + " waiting" else ""
+                      Text(
+                          (vm.anaProgress * 100).toInt().toString() + "%" + more,
+                          color = CDim, fontSize = 10.sp
+                      )
+                  }
+                  Box(Modifier.width(10.dp))
+                  Box(
+                      Modifier.height(34.dp).clip(RoundedCornerShape(10.dp)).background(Color(0x14FFFFFF))
+                          .tap { vm.skipCurrent() }.padding(horizontal = 12.dp),
+                      contentAlignment = Alignment.Center
+                  ) { Text("Skip", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                  Box(Modifier.width(6.dp))
+                  Box(
+                      Modifier.height(34.dp).clip(RoundedCornerShape(10.dp)).background(Color(0x22FF6B81))
+                          .tap { vm.stopAll() }.padding(horizontal = 12.dp),
+                      contentAlignment = Alignment.Center
+                  ) { Text("Stop", color = CHeart, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+              }
+          }
+
           // ---------------------------------------------------------------- bottom controls
           @Composable
           fun Controls(vm: PlayerVm) {
@@ -2295,6 +3112,19 @@ jobs:
           }
           KOTLIN_EOF
 
+      - name: Download stem models (Spleeter drums + bass, ONNX)
+        run: |
+          mkdir -p app/src/main/assets
+          BASE=https://huggingface.co/Best-Practice/spleeter-4stems-onnx/resolve/main
+          for M in drums bass; do
+            curl -L --fail --retry 4 --retry-delay 5 -o app/src/main/assets/$M.onnx "$BASE/$M.onnx"
+            SZ=$(stat -c %s app/src/main/assets/$M.onnx)
+            echo "$M.onnx = $SZ bytes"
+            if [ "$SZ" -lt 30000000 ]; then
+              echo "Model download looks wrong ($M.onnx too small)"; exit 1
+            fi
+          done
+
       - name: Generate dummy keystore
         run: |
           keytool -genkeypair -v -keystore app/dummy.keystore -alias dummy \
@@ -2353,6 +3183,7 @@ jobs:
           mkdir -p bundle
           cp app/build/outputs/apk/release/app-arm64-v8a-release.apk bundle/GreyPulse.apk
           cp -r app/src bundle/source
+          rm -rf bundle/source/main/assets
           cp .github/workflows/build.yml bundle/build.yml
           {
             echo "App: GreyPulse (com.grey.pulse)"
