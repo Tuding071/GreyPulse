@@ -825,7 +825,7 @@ jobs:
            * Center: a black disc. The bass spectrum (Cfg.bassLo at the bottom -> Cfg.bassHi at the top)
            * bulges the edge outward as smooth arcs around one half circle, mirrored on the other half.
            * Only real notes / peaks arc (spectral contrast + gate), flat Hz stay out of sight.
-           * Behind the disc sit 3 flanges: white (semi glow), black, white (semi glow). Each one reacts
+           * Behind the disc sit 3 flanges (only their arcs show): white (semi glow), black, white (semi glow). Each one reacts
            * Cfg.flDelay ms later than the one inside it and sits at an offset position (Cfg.flOffset).
            * Mid range makes the whole disc drift (no tilting). Beats pop the disc and scatter particles.
            * Bass also makes the particles rumble in/out along their own path.
@@ -842,8 +842,8 @@ jobs:
                   const val HIST = 256
                   const val MAXP = 600
                   const val POINTS = 220
-                  val BASE_R = floatArrayOf(0.30f, 0.36f, 0.42f, 0.48f)  // main -> flange 3 (x u)
-                  val ARC = floatArrayOf(0.22f, 0.24f, 0.26f, 0.28f)     // how far each layer's arcs reach
+                  const val BASE_R = 0.30f                               // one shared base: flanges hide behind the disc
+                  val ARC = floatArrayOf(0.22f, 0.27f, 0.32f, 0.37f)     // how far each layer's arcs reach (x u)
                   val WHITE = booleanArrayOf(false, true, false, true)   // black main, white, black, white
                   val PIF = Math.PI.toFloat()
               }
@@ -851,6 +851,7 @@ jobs:
               private val nb = AudioBus.BANDS
               private val sm = FloatArray(nb)
               private val tmp = FloatArray(nb)
+              private val hold = FloatArray(nb)   // how long a non-lowest note has been sounding (s)
               private val hist = Array(HIST) { FloatArray(nb) }
               private val hT = FloatArray(HIST)
               private val hMid = FloatArray(HIST)
@@ -902,15 +903,17 @@ jobs:
               }
               private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
 
-              private val px = FloatArray(MAXP) { Random.nextFloat() }
-              private val py = FloatArray(MAXP) { Random.nextFloat() }
+              private val px = FloatArray(MAXP)   // position (px)
+              private val py = FloatArray(MAXP)
+              private val pvx = FloatArray(MAXP)  // velocity (px/s)
+              private val pvy = FloatArray(MAXP)
+              private val pa = FloatArray(MAXP)   // fade-in 0..1 (new particles appear from nothing)
+              private var pInit = false
               private val psz = FloatArray(MAXP) { Random.nextFloat() * 2.5f + 0.6f }
               private val pspd = FloatArray(MAXP) { Random.nextFloat() * 0.35f + 0.12f }
               private val pph = FloatArray(MAXP) { Random.nextFloat() * 6.28f }
               private val ptw = FloatArray(MAXP) { Random.nextFloat() * 1.2f + 0.4f }
               private val pjit = FloatArray(MAXP) { Random.nextFloat() }
-              private val sc = FloatArray(MAXP)   // scatter offset (px, along the line from the center)
-              private val sv = FloatArray(MAXP)   // scatter velocity
 
               override fun onDraw(canvas: Canvas) {
                   val w = width.toFloat()
@@ -963,6 +966,28 @@ jobs:
                       val pk = ((sm[i] - local) * 2f).coerceIn(0f, 1f)
                       val v = sm[i].coerceIn(0f, 1f) * (1f - nf) + pk * nf
                       tmp[i] = ((v - gate) / (1f - gate)).coerceIn(0f, 1f)
+                  }
+
+                  // lowest note wins: only the lowest strong peak keeps its arc, other notes are dismissed after 500 ms
+                  var peakMax = 0f
+                  for (i in 0 until nb) if (tmp[i] > peakMax) peakMax = tmp[i]
+                  val pkThr = max(0.1f, peakMax * 0.35f)
+                  var win = -1
+                  for (i in 0 until nb) {
+                      val l = if (i > 0) tmp[i - 1] else 0f
+                      val r = if (i < nb - 1) tmp[i + 1] else 0f
+                      if (tmp[i] >= pkThr && tmp[i] >= l && tmp[i] > r) { win = i; break }
+                  }
+                  val lobe = ex + 1
+                  for (i in 0 until nb) {
+                      if (win < 0 || abs(i - win) <= lobe) {
+                          hold[i] = 0f
+                      } else if (tmp[i] > 0.05f) {
+                          hold[i] += dt
+                          tmp[i] *= (1f - (hold[i] - 0.35f) / 0.15f).coerceIn(0f, 1f)
+                      } else {
+                          hold[i] = max(0f, hold[i] - dt * 3f)
+                      }
                   }
 
                   head = (head + 1) % HIST
@@ -1072,36 +1097,74 @@ jobs:
               }
 
               // ------------------------------------------------------------ particles
+              // They wander slowly. A beat SHOOTS the ones near the center outward (no spring back);
+              // once a particle leaves the view it is gone, and a new one fades in somewhere else.
+              private fun spawn(i: Int, w: Float, h: Float, first: Boolean) {
+                  var x = 0f
+                  var y = 0f
+                  for (t in 0 until 6) {
+                      x = Random.nextFloat() * w
+                      y = Random.nextFloat() * h
+                      val dx = x - cx
+                      val dy = y - cy
+                      if (dx * dx + dy * dy > 0.49f * uu * uu) break
+                  }
+                  px[i] = x; py[i] = y
+                  pvx[i] = 0f; pvy[i] = 0f
+                  pa[i] = if (first) 1f else 0f
+              }
+
               private fun drawParticles(canvas: Canvas, w: Float, h: Float, dt: Float) {
+                  if (!pInit) {
+                      for (i in 0 until MAXP) spawn(i, w, h, true)
+                      pInit = true
+                  }
                   val n = Cfg.pCount.coerceIn(10, MAXP)
                   val imp = pendingScatter
                   pendingScatter = 0f
                   val be = hEn[idxAt(time - Cfg.syncMs / 1000f)]
                   val rum = Cfg.pRumble * be * 2.2f
                   val sizeMul = Cfg.pSize
+                  val relax = 1f - exp(-dt * 0.7f)
+                  val margin = 40f * dens
 
                   for (i in 0 until n) {
-                      val bx = px[i] * w + sin(time * pspd[i] + pph[i]) * 14f * dens
-                      val by = py[i] * h + cos(time * pspd[i] * 0.8f + pph[i]) * 18f * dens
-                      val dx = bx - cx
-                      val dy = by - cy
+                      val dx = px[i] - cx
+                      val dy = py[i] - cy
                       val dist = sqrt(dx * dx + dy * dy) + 1f
                       val ux = dx / dist
                       val uy = dy / dist
                       val infl = 1f / (1f + dist / (0.9f * uu))
 
-                      if (imp > 0f) sv[i] += imp * 380f * dens * (0.5f + pjit[i]) * infl * 1.6f
-                      sv[i] += (-6f * sc[i] - 3.2f * sv[i]) * dt
-                      sc[i] += sv[i] * dt
+                      // beat: shoot away from the center
+                      if (imp > 0f) {
+                          val k = imp * 1100f * dens * (0.5f + pjit[i]) * infl
+                          pvx[i] += ux * k
+                          pvy[i] += uy * k
+                      }
+                      // gentle wandering, kicked speed slowly eases back to it
+                      val dvx = cos(time * 0.35f + pph[i] * 2f) * pspd[i] * 90f * dens
+                      val dvy = sin(time * 0.28f + pph[i] * 3f) * pspd[i] * 70f * dens
+                      pvx[i] += (dvx - pvx[i]) * relax
+                      pvy[i] += (dvy - pvy[i]) * relax
+                      px[i] += pvx[i] * dt
+                      py[i] += pvy[i] * dt
+
+                      // out of view -> gone, reappears from nowhere
+                      if (px[i] < -margin || px[i] > w + margin || py[i] < -margin || py[i] > h + margin) {
+                          spawn(i, w, h, false)
+                          continue
+                      }
+                      if (pa[i] < 1f) pa[i] = min(1f, pa[i] + dt * 0.8f)
 
                       val osc = sin(time * (14f + pjit[i] * 10f) + pph[i] * 3f)
-                      val off = sc[i] + rum * 14f * dens * osc * infl
+                      val off = rum * 14f * dens * osc * infl
                       val perp = rum * 4f * dens * sin(time * 23f + pph[i] * 5f) * infl
-                      val x = bx + ux * off - uy * perp
-                      val y = by + uy * off + ux * perp
+                      val x = px[i] + ux * off - uy * perp
+                      val y = py[i] + uy * off + ux * perp
 
                       val tw = 0.5f + 0.5f * sin(time * ptw[i] + pph[i])
-                      val a = (0.15f + 0.5f * tw + energy * 0.35f + pop * 0.25f).coerceIn(0f, 1f)
+                      val a = ((0.15f + 0.5f * tw + energy * 0.35f + pop * 0.25f) * pa[i]).coerceIn(0f, 1f)
                       val r = psz[i] * dens * 0.5f * sizeMul * (1f + be * 0.5f)
                       if (psz[i] > 1.6f) {
                           dot.alpha = (a * 70f).toInt()
@@ -1118,6 +1181,7 @@ jobs:
                   val fo = Cfg.flOffset
                   val glowBase = (0.6f + 0.8f * energy + 0.5f * pop) * Cfg.flGlow
                   val reach = Cfg.arcHeight
+                  val inset = 10f * dens
 
                   // outermost flange first, main black disc last (on top)
                   for (l in 3 downTo 0) {
@@ -1127,9 +1191,9 @@ jobs:
                       val lp = if (l == 0) pop else hPop[pi]
                       val scale = 1f + (0.16f * lp * Cfg.popStrength).coerceAtMost(0.5f)
 
-                      // position offset: trails the current center + stacks slightly upward (stays mirrored)
+                      // position offset: flanges trail the current center
                       val ccx = cx + ox + (hOx[pi] - ox) * fo
-                      val ccy = cy + oy + (hOy[pi] - oy) * fo - l * 0.02f * uu * fo
+                      val ccy = cy + oy + (hOy[pi] - oy) * fo
 
                       path.reset()
                       for (k in 0 until POINTS) {
@@ -1142,7 +1206,8 @@ jobs:
                           val fr = bp - i0
                           val s = fr * fr * (3f - 2f * fr)
                           val v = hh[i0] + (hh[i0 + 1] - hh[i0]) * s
-                          val r = uu * scale * (BASE_R[l] * pulse + ARC[l] * reach * v)
+                          // flanges sit slightly inside the disc, so only their arcs (and arc glow) show
+                          val r = uu * scale * (BASE_R * pulse + ARC[l] * reach * v) - (if (l > 0) inset else 0f)
                           val x = ccx + r * sin(a)
                           val y = ccy + r * cos(a)
                           if (k == 0) path.moveTo(x, y) else path.lineTo(x, y)
@@ -1152,7 +1217,7 @@ jobs:
                           for (g in 0..2) {
                               glow.color = Color.WHITE
                               glow.alpha = ((46 - g * 13) * glowBase).toInt().coerceIn(0, 255)
-                              glow.strokeWidth = (8f + g * 12f) * dens
+                              glow.strokeWidth = (5f + g * 7f) * dens
                               canvas.drawPath(path, glow)
                           }
                           canvas.drawPath(path, fillWhite)
@@ -1198,6 +1263,8 @@ jobs:
           import androidx.compose.foundation.background
           import androidx.compose.foundation.border
           import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gestures.awaitEachGesture
+          import androidx.compose.foundation.gestures.awaitFirstDown
           import androidx.compose.foundation.gestures.detectHorizontalDragGestures
           import androidx.compose.foundation.gestures.detectTapGestures
           import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -1875,6 +1942,23 @@ jobs:
           }
 
           // ---------------------------------------------------------------- visualizer settings
+          /** Press / drag anywhere on the row: reports 0..1 across the width, and keeps the drag (no list scrolling). */
+          fun Modifier.dragX(key: Any?, onX: (Float) -> Unit): Modifier = pointerInput(key) {
+              awaitEachGesture {
+                  val down = awaitFirstDown(requireUnconsumed = false)
+                  val w = size.width.toFloat().coerceAtLeast(1f)
+                  onX((down.position.x / w).coerceIn(0f, 1f))
+                  down.consume()
+                  while (true) {
+                      val ev = awaitPointerEvent()
+                      val c = ev.changes.firstOrNull { it.id == down.id } ?: break
+                      if (!c.pressed) break
+                      onX((c.position.x / w).coerceIn(0f, 1f))
+                      c.consume()
+                  }
+              }
+          }
+
           @Composable
           fun SliderRow(label: String, valueText: String, frac: Float, onFrac: (Float) -> Unit) {
               val cb by rememberUpdatedState(onFrac)
@@ -1888,15 +1972,9 @@ jobs:
                   Box(
                       Modifier
                           .fillMaxWidth()
-                          .height(30.dp)
+                          .height(36.dp)
                           .onSizeChanged { wPx = it.width.toFloat().coerceAtLeast(1f) }
-                          .pointerInput(Unit) { detectTapGestures { o -> cb((o.x / wPx).coerceIn(0f, 1f)) } }
-                          .pointerInput(Unit) {
-                              detectHorizontalDragGestures(
-                                  onDragStart = { o -> cb((o.x / wPx).coerceIn(0f, 1f)) },
-                                  onHorizontalDrag = { ch, _ -> cb((ch.position.x / wPx).coerceIn(0f, 1f)) }
-                              )
-                          },
+                          .dragX(Unit) { cb(it) },
                       contentAlignment = Alignment.CenterStart
                   ) {
                       Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(99.dp)).background(CSurf3))
@@ -2199,17 +2277,7 @@ jobs:
                           .weight(1f)
                           .height(32.dp)
                           .onSizeChanged { wPx = it.width.toFloat().coerceAtLeast(1f) }
-                          .pointerInput(enabled) {
-                              if (!enabled) return@pointerInput
-                              detectTapGestures { o -> cb(gainFor(o.x, wPx)) }
-                          }
-                          .pointerInput(enabled) {
-                              if (!enabled) return@pointerInput
-                              detectHorizontalDragGestures(
-                                  onDragStart = { o -> cb(gainFor(o.x, wPx)) },
-                                  onHorizontalDrag = { ch, _ -> cb(gainFor(ch.position.x, wPx)) }
-                              )
-                          },
+                          .dragX(enabled) { if (enabled) cb(gainFor(it, 1f)) },
                       contentAlignment = Alignment.CenterStart
                   ) {
                       Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(99.dp)).background(CSurf3))
