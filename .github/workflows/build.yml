@@ -1,4 +1,4 @@
-name: Build GreyPulse
+name: Build GreyPulseX
 
 on:
   push:
@@ -31,12 +31,12 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-greypulse-${{ hashFiles('.github/workflows/build.yml') }}
-          restore-keys: gradle-greypulse-
+          key: gradle-greypulsex-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: gradle-greypulsex-
 
       - name: Generate project structure
         run: |
-          mkdir -p app/src/main/java/com/grey/pulse
+          mkdir -p app/src/main/java/com/grey/pulsex
           mkdir -p app/src/main/res/values
 
           cat > settings.gradle.kts << 'EOF'
@@ -54,7 +54,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "GreyPulse"
+          rootProject.name = "GreyPulseX"
           include(":app")
           EOF
 
@@ -85,11 +85,11 @@ jobs:
           val buildNum = (System.getenv("BUILD_NUMBER") ?: "1").toInt()
 
           android {
-              namespace = "com.grey.pulse"
+              namespace = "com.grey.pulsex"
               compileSdk = 36
 
               defaultConfig {
-                  applicationId = "com.grey.pulse"
+                  applicationId = "com.grey.pulsex"
                   minSdk = 26
                   targetSdk = 36
                   versionCode = buildNum
@@ -167,6 +167,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+              <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
               <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -178,7 +179,7 @@ jobs:
                   android:allowBackup="false"
                   android:icon="@mipmap/ic_launcher"
                   android:roundIcon="@mipmap/ic_launcher_round"
-                  android:label="GreyPulse"
+                  android:label="GreyPulseX"
                   android:theme="@style/AppTheme">
 
                   <activity
@@ -210,7 +211,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
-                  <item name="android:windowBackground">#FF0E0E10</item>
+                  <item name="android:windowBackground">#FF2B2B30</item>
                   <item name="android:statusBarColor">#00000000</item>
                   <item name="android:navigationBarColor">#00000000</item>
               </style>
@@ -220,14 +221,13 @@ jobs:
           cat > app/src/main/res/values/strings.xml << 'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
-              <string name="app_name">GreyPulse</string>
+              <string name="app_name">GreyPulseX</string>
           </resources>
           EOF
 
-          cat > app/src/main/java/com/grey/pulse/Audio.kt << 'KOTLIN_EOF'
-          package com.grey.pulse
+          cat > app/src/main/java/com/grey/pulsex/Audio.kt << 'KOTLIN_EOF'
+          package com.grey.pulsex
 
-          import android.content.SharedPreferences
           import androidx.annotation.OptIn
           import androidx.media3.common.C
           import androidx.media3.common.audio.AudioProcessor
@@ -246,99 +246,28 @@ jobs:
 
           data class EqBand(val freq: Int, val gain: Int)
 
-          /** All visualizer settings (menu > Visualizer). Defaults are what you asked for. */
+          /** Fixed analysis ranges that feed the HTML visualizers (GreyPulse.levels / mid). */
           object Cfg {
-              // arcs (bass), bottom of the circle = bassLo, top = bassHi
-              @Volatile var bassLo = 1           // Hz, bottom of the circle
-              @Volatile var bassHi = 80          // Hz, top of the circle
-              @Volatile var arcSens = 1f         // how strongly the arcs react
-              @Volatile var arcHeight = 1f       // how far the arcs stick out
-              @Volatile var noteFocus = 0.7f     // 0 = every Hz moves, 1 = only notes / peaks arc
-              @Volatile var gate = 0.15f         // levels under this are ignored (keeps non-note Hz flat)
-              @Volatile var smooth = 0.5f        // blends neighbouring arcs together
-
-              // flanges
-              @Volatile var flDelay = 100        // ms each flange trails the one inside it
-              @Volatile var flOffset = 1f        // position offset between flanges
-              @Volatile var flGlow = 1f          // glow of the white flanges
-
-              // mid motion
-              @Volatile var midLo = 1000         // Hz, rocking motion range
+              @Volatile var bassLo = 16          // Hz, levels[0]
+              @Volatile var bassHi = 60          // Hz, levels[11]
+              @Volatile var midLo = 1000         // Hz, GreyPulse.mid
               @Volatile var midHi = 4000
-              @Volatile var midSens = 1f
-              @Volatile var midMove = 1f         // how far the center moves
-
-              // beat
               @Volatile var beatSens = 1f
-              @Volatile var popStrength = 1f     // how big the center gets on a beat
-              @Volatile var scatter = 1f         // how far particles are kicked on a beat
-              @Volatile var syncMs = 120         // visuals delay to match the speaker
-
-              // particles
-              @Volatile var pSize = 1f
-              @Volatile var pCount = 160
-              @Volatile var pRumble = 1f
-              @Volatile var rangeVersion = 0     // bump when a Hz range changes (processor retunes)
-
-              fun reset() {
-                  bassLo = 1; bassHi = 80; arcSens = 1f; arcHeight = 1f
-                  noteFocus = 0.7f; gate = 0.15f; smooth = 0.5f
-                  flDelay = 100; flOffset = 1f; flGlow = 1f
-                  midLo = 1000; midHi = 4000; midSens = 1f; midMove = 1f
-                  beatSens = 1f; popStrength = 1f; scatter = 1f; syncMs = 120
-                  pSize = 1f; pCount = 160; pRumble = 1f
-              }
-
-              fun load(p: SharedPreferences) {
-                  bassLo = p.getInt("d_lo", 1)
-                  bassHi = p.getInt("d_hi", 80)
-                  arcSens = p.getFloat("d_sens", 1f)
-                  arcHeight = p.getFloat("d_height", 1f)
-                  noteFocus = p.getFloat("d_focus", 0.7f)
-                  gate = p.getFloat("d_gate", 0.15f)
-                  smooth = p.getFloat("d_smooth", 0.5f)
-                  flDelay = p.getInt("d_fldelay", 100)
-                  flOffset = p.getFloat("d_floff", 1f)
-                  flGlow = p.getFloat("d_flglow", 1f)
-                  midLo = p.getInt("c_midLo", 1000)
-                  midHi = p.getInt("c_midHi", 4000)
-                  midSens = p.getFloat("c_midSens", 1f)
-                  midMove = p.getFloat("c_midMove", 1f)
-                  beatSens = p.getFloat("c_beatSens", 1f)
-                  popStrength = p.getFloat("c_pop", 1f)
-                  scatter = p.getFloat("c_scatter", 1f)
-                  syncMs = p.getInt("c_sync", 120)
-                  pSize = p.getFloat("c_pSize", 1f)
-                  pCount = p.getInt("c_pCount", 160)
-                  pRumble = p.getFloat("c_pRumble", 1f)
-                  if (bassHi < bassLo + 5) bassHi = bassLo + 5
-                  if (midHi < midLo + 200) midHi = midLo + 200
-                  rangeVersion++
-              }
-
-              fun save(p: SharedPreferences) {
-                  p.edit()
-                      .putInt("d_lo", bassLo).putInt("d_hi", bassHi)
-                      .putFloat("d_sens", arcSens).putFloat("d_height", arcHeight)
-                      .putFloat("d_focus", noteFocus).putFloat("d_gate", gate).putFloat("d_smooth", smooth)
-                      .putInt("d_fldelay", flDelay).putFloat("d_floff", flOffset).putFloat("d_flglow", flGlow)
-                      .putInt("c_midLo", midLo).putInt("c_midHi", midHi).putFloat("c_midSens", midSens)
-                      .putFloat("c_midMove", midMove).putFloat("c_beatSens", beatSens)
-                      .putFloat("c_pop", popStrength).putFloat("c_scatter", scatter).putInt("c_sync", syncMs)
-                      .putFloat("c_pSize", pSize).putInt("c_pCount", pCount).putFloat("c_pRumble", pRumble)
-                      .apply()
-              }
+              @Volatile var rangeVersion = 0
           }
 
           /**
            * Shared in-process bridge between the audio thread (BusProcessor) and the UI.
-           *  levels[] : 40 bass bands from Cfg.bassLo to Cfg.bassHi Hz, each 0..1 (bottom of circle -> top)
-           *  mid      : average level of the mid range (Cfg.midLo..midHi), drives the rocking motion
+           *  levels[] : 12 bass bands from Cfg.bassLo to Cfg.bassHi Hz, each 0..1
+           *  mid      : average level of the mid range, 0..1
            *  beat queue: detected beats (wall-clock nanoTime, strength, kind 0=beat 1=bar 2=8-bar phrase)
+           *  analyzeOn : analysis only runs while an HTML visualizer is selected (saves battery)
            */
           object AudioBus {
-              const val BANDS = 40
+              const val BANDS = 12
               const val QN = 16
+
+              @Volatile var analyzeOn = false
 
               @JvmField val levels = FloatArray(BANDS)
               @Volatile var mid = 0f
@@ -375,16 +304,14 @@ jobs:
           /**
            * Sits in ExoPlayer's audio chain (16-bit PCM only):
            *  1) user EQ: one peaking biquad per band (gain -50..0 dB)
-           *  2) bass analysis (Goertzel, Cfg.bassLo..bassHi) -> AudioBus.levels
-           *  3) mid analysis (Goertzel, Cfg.midLo..midHi)    -> AudioBus.mid
-           *  4) beat detection on the low band + tempo / bar tracking -> AudioBus beat queue
+           *  2) bass + mid + beat analysis (only when AudioBus.analyzeOn) -> AudioBus
            * Analysis runs AFTER the EQ, so the visuals follow what you actually hear.
            */
           @OptIn(UnstableApi::class)
           class BusProcessor : BaseAudioProcessor() {
 
               companion object {
-                  private const val N = 512          // bass Goertzel window (decimated samples, longer = finer notes)
+                  private const val N = 256          // bass Goertzel window (decimated samples)
                   private const val HOP = 32
                   private const val EQ_Q = 1.0
                   private const val N2 = 512         // mid Goertzel window (raw samples)
@@ -486,7 +413,7 @@ jobs:
 
               /** Recompute the Goertzel frequency tables from the current settings. */
               private fun retune() {
-                  val lo = Cfg.bassLo.toDouble().coerceAtLeast(1.0)
+                  val lo = Cfg.bassLo.toDouble().coerceAtLeast(5.0)
                   val hi = Cfg.bassHi.toDouble().coerceAtLeast(lo + 5.0)
                   val target = max(1400.0, hi * 6.0)
                   val newDec = max(1, (sr / target).toInt())
@@ -517,6 +444,7 @@ jobs:
                   syncEq()
                   chunkNs = System.nanoTime()
                   val on = AudioBus.eqOn && nBands > 0
+                  val an = AudioBus.analyzeOn
                   if (on && !eqWasOn) java.util.Arrays.fill(st, 0.0)
                   eqWasOn = on
                   val frames = n / (2 * ch)
@@ -541,7 +469,7 @@ jobs:
                           out.putShort(v.toShort())
                           mono += x
                       }
-                      analyze(mono / ch)
+                      if (an) analyze(mono / ch)
                   }
                   while (inputBuffer.hasRemaining()) out.put(inputBuffer.get())
                   out.flip()
@@ -732,8 +660,8 @@ jobs:
           }
           KOTLIN_EOF
 
-          cat > app/src/main/java/com/grey/pulse/PlaybackService.kt << 'KOTLIN_EOF'
-          package com.grey.pulse
+          cat > app/src/main/java/com/grey/pulsex/PlaybackService.kt << 'KOTLIN_EOF'
+          package com.grey.pulsex
 
           import android.content.Context
           import android.content.Intent
@@ -763,7 +691,7 @@ jobs:
                           enableFloatOutput: Boolean,
                           enableAudioTrackPlaybackParams: Boolean
                       ): AudioSink {
-                          // our processor goes first: EQ + bass analysis
+                          // our processor goes first: EQ + analysis for HTML visualizers
                           return DefaultAudioSink.Builder(context)
                               .setAudioProcessors(arrayOf<AudioProcessor>(BusProcessor()))
                               .build()
@@ -800,439 +728,312 @@ jobs:
           }
           KOTLIN_EOF
 
-          cat > app/src/main/java/com/grey/pulse/VisualizerView.kt << 'KOTLIN_EOF'
-          package com.grey.pulse
+          cat > app/src/main/java/com/grey/pulsex/VizHost.kt << 'KOTLIN_EOF'
+          package com.grey.pulsex
 
+          import android.annotation.SuppressLint
           import android.content.Context
-          import android.graphics.Canvas
-          import android.graphics.Color
-          import android.graphics.Paint
-          import android.graphics.Path
-          import android.view.View
-          import kotlin.math.abs
-          import kotlin.math.cos
-          import kotlin.math.exp
-          import kotlin.math.floor
-          import kotlin.math.max
-          import kotlin.math.min
-          import kotlin.math.pow
+          import android.os.Handler
+          import android.os.Looper
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebChromeClient
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberUpdatedState
+          import androidx.compose.runtime.withFrameMillis
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.viewinterop.AndroidView
+          import org.json.JSONObject
+          import java.io.File
           import kotlin.math.roundToInt
-          import kotlin.math.sin
-          import kotlin.math.sqrt
-          import kotlin.random.Random
 
-          /**
-           * Center: a black disc. The bass spectrum (Cfg.bassLo at the bottom -> Cfg.bassHi at the top)
-           * bulges the edge outward as smooth arcs around one half circle, mirrored on the other half.
-           * Only real notes / peaks arc (spectral contrast + gate), flat Hz stay out of sight.
-           * Behind the disc sit 3 flanges (only their arcs show): white (semi glow), black, white (semi glow). Each one reacts
-           * Cfg.flDelay ms later than the one inside it and sits at an offset position (Cfg.flOffset).
-           * Mid range makes the whole disc drift (no tilting). Beats pop the disc and scatter particles.
-           * Bass also makes the particles rumble in/out along their own path.
-           * Everything is tweakable in menu > Visualizer (see Cfg).
-           */
-          class VisualizerView(ctx: Context) : View(ctx) {
+          val GreyBg = Color(0xFF2B2B30)
+          const val SYNC_MS = 120L   // beats are delivered this much later to match the speaker
 
-              @JvmField var playing = false
+          class VizItem(val id: String, val name: String)
 
-              companion object {
-                  const val CONTRAST = 1.6f
-                  const val ATTACK = 26f
-                  const val DECAY = 6f
-                  const val HIST = 256
-                  const val MAXP = 600
-                  const val POINTS = 220
-                  const val BASE_R = 0.30f                               // one shared base: flanges hide behind the disc
-                  val ARC = floatArrayOf(0.22f, 0.27f, 0.32f, 0.37f)     // how far each layer's arcs reach (x u)
-                  val WHITE = booleanArrayOf(false, true, false, true)   // black main, white, black, white
-                  val PIF = Math.PI.toFloat()
+          /** Saved visualizers: one .html file each in filesDir/viz. */
+          object VizStore {
+              private fun dir(ctx: Context): File {
+                  val d = File(ctx.filesDir, "viz")
+                  if (!d.exists()) d.mkdirs()
+                  return d
               }
 
-              private val nb = AudioBus.BANDS
-              private val sm = FloatArray(nb)
-              private val tmp = FloatArray(nb)
-              private val hold = FloatArray(nb)   // how long a non-lowest note has been sounding (s)
-              private val hist = Array(HIST) { FloatArray(nb) }
-              private val hT = FloatArray(HIST)
-              private val hMid = FloatArray(HIST)
-              private val hEn = FloatArray(HIST)
-              private val hPop = FloatArray(HIST)
-              private val hOx = FloatArray(HIST)
-              private val hOy = FloatArray(HIST)
-              private var head = 0
-              private var hCount = 0
-              private var lastNs = 0L
-              private var time = 0f
-              private var energy = 0f
-              private var midBase = 0f
-              private var midSm = 0f
-              private var midPrev = 0f
-              private val dens = ctx.resources.displayMetrics.density
-
-              // drifting motion (no rotation)
-              private var mx = 0f
-              private var my = 0f
-              private var mvx = 0f
-              private var mvy = 0f
-              private var ox = 0f
-              private var oy = 0f
-
-              // beats
-              private var pop = 0f
-              private var pendingScatter = 0f
-              private var lastSeen = AudioBus.beatHead
-              private val pendNs = LongArray(16)
-              private val pendS = FloatArray(16)
-              private val pendK = IntArray(16)
-              private var pendN = 0
-
-              // geometry
-              private var cx = 0f
-              private var cy = 0f
-              private var uu = 1f
-
-              private val path = Path()
-              private val fillWhite = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  color = Color.argb(226, 255, 255, 255); style = Paint.Style.FILL
-              }
-              private val fillBlack = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  color = Color.BLACK; style = Paint.Style.FILL
-              }
-              private val glow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  style = Paint.Style.STROKE; strokeJoin = Paint.Join.ROUND
-              }
-              private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
-
-              private val px = FloatArray(MAXP)   // position (px)
-              private val py = FloatArray(MAXP)
-              private val pvx = FloatArray(MAXP)  // velocity (px/s)
-              private val pvy = FloatArray(MAXP)
-              private val pa = FloatArray(MAXP)   // fade-in 0..1 (new particles appear from nothing)
-              private var pInit = false
-              private val psz = FloatArray(MAXP) { Random.nextFloat() * 2.5f + 0.6f }
-              private val pspd = FloatArray(MAXP) { Random.nextFloat() * 0.35f + 0.12f }
-              private val pph = FloatArray(MAXP) { Random.nextFloat() * 6.28f }
-              private val ptw = FloatArray(MAXP) { Random.nextFloat() * 1.2f + 0.4f }
-              private val pjit = FloatArray(MAXP) { Random.nextFloat() }
-
-              override fun onDraw(canvas: Canvas) {
-                  val w = width.toFloat()
-                  val h = height.toFloat()
-                  if (w <= 0f || h <= 0f) return
-                  val now = System.nanoTime()
-                  val dt = if (lastNs == 0L) 0.016f else ((now - lastNs) / 1_000_000_000f).coerceIn(0.001f, 0.05f)
-                  lastNs = now
-                  time += dt
-                  cx = w / 2f
-                  cy = h * 0.40f
-                  uu = min(w * 0.5f, h * 0.32f)
-
-                  updateLevels(dt, now)
-                  processBeats(now, dt)
-                  updateMotion(dt)
-                  drawParticles(canvas, w, h, dt)
-                  drawRings(canvas)
-                  postInvalidateOnAnimation()
+              /** Name = <meta name="greypulse-name" content="...">, else <title>, else "Visualizer". */
+              fun parseName(html: String): String {
+                  val tag = Regex("<meta[^>]*greypulse-name[^>]*>", RegexOption.IGNORE_CASE).find(html)?.value
+                  if (tag != null) {
+                      val c = Regex("content\\s*=\\s*[\"']([^\"']*)[\"']", RegexOption.IGNORE_CASE)
+                          .find(tag)?.groupValues?.get(1)?.trim()
+                      if (!c.isNullOrEmpty()) return c.take(40)
+                  }
+                  val t = Regex("<title[^>]*>([^<]*)</title>", RegexOption.IGNORE_CASE)
+                      .find(html)?.groupValues?.get(1)?.trim()
+                  if (!t.isNullOrEmpty()) return t.take(40)
+                  return "Visualizer"
               }
 
-              // ------------------------------------------------------------ levels + history
-              private fun updateLevels(dt: Float, now: Long) {
-                  val fresh = playing && (now - AudioBus.lastUpdateNs) < 250_000_000L
-                  val ka = 1f - exp(-dt * ATTACK)
-                  val kd = 1f - exp(-dt * DECAY)
-                  val sens = Cfg.arcSens
-                  var sum = 0f
-                  for (i in 0 until nb) {
-                      val raw = if (fresh) AudioBus.levels[i] else 0f
-                      val t = (raw * sens).coerceIn(0f, 1.5f).pow(CONTRAST)
-                      sm[i] += (t - sm[i]) * (if (t > sm[i]) ka else kd)
-                      sum += sm[i]
-                  }
-                  energy = (sum / nb).coerceIn(0f, 1f)
-
-                  // note focus: a note is a band that stands above its surroundings (skirt of itself excluded)
-                  val bandHz = (Cfg.bassHi - Cfg.bassLo).coerceAtLeast(5) / (nb - 1f)
-                  val ex = (11f / bandHz).roundToInt().coerceIn(1, 6)
-                  val far = ex * 3
-                  val nf = Cfg.noteFocus.coerceIn(0f, 1f)
-                  val gate = Cfg.gate.coerceIn(0f, 0.9f)
-                  for (i in 0 until nb) {
-                      var ns = 0f
-                      var cnt = 0
-                      for (j in max(0, i - far)..min(nb - 1, i + far)) {
-                          if (abs(j - i) > ex) { ns += sm[j]; cnt++ }
-                      }
-                      val local = if (cnt > 0) ns / cnt else 0f
-                      val pk = ((sm[i] - local) * 2f).coerceIn(0f, 1f)
-                      val v = sm[i].coerceIn(0f, 1f) * (1f - nf) + pk * nf
-                      tmp[i] = ((v - gate) / (1f - gate)).coerceIn(0f, 1f)
-                  }
-
-                  // lowest note wins: only the lowest strong peak keeps its arc, other notes are dismissed after 500 ms
-                  var peakMax = 0f
-                  for (i in 0 until nb) if (tmp[i] > peakMax) peakMax = tmp[i]
-                  val pkThr = max(0.1f, peakMax * 0.35f)
-                  var win = -1
-                  for (i in 0 until nb) {
-                      val l = if (i > 0) tmp[i - 1] else 0f
-                      val r = if (i < nb - 1) tmp[i + 1] else 0f
-                      if (tmp[i] >= pkThr && tmp[i] >= l && tmp[i] > r) { win = i; break }
-                  }
-                  val lobe = ex + 1
-                  for (i in 0 until nb) {
-                      if (win < 0 || abs(i - win) <= lobe) {
-                          hold[i] = 0f
-                      } else if (tmp[i] > 0.05f) {
-                          hold[i] += dt
-                          tmp[i] *= (1f - (hold[i] - 0.35f) / 0.15f).coerceIn(0f, 1f)
-                      } else {
-                          hold[i] = max(0f, hold[i] - dt * 3f)
-                      }
-                  }
-
-                  head = (head + 1) % HIST
-                  val dst = hist[head]
-                  // neighbour blend so the arcs flow into each other
-                  val s = Cfg.smooth.coerceIn(0f, 1f)
-                  for (i in 0 until nb) {
-                      val a = tmp[max(0, i - 1)]
-                      val b = tmp[min(nb - 1, i + 1)]
-                      dst[i] = tmp[i] * (1f - 0.5f * s) + (a + b) * 0.25f * s
-                  }
-                  hT[head] = time
-                  hEn[head] = energy
-
-                  // mid: look at the change versus a slow baseline so it moves with the music, not constantly
-                  val midRaw = if (fresh) AudioBus.mid else 0f
-                  midBase += (midRaw - midBase) * min(1f, dt / 4f)
-                  val m = if (fresh) (((midRaw - midBase) * 4f + 0.3f) * Cfg.midSens).coerceIn(0f, 1.2f) else 0f
-                  midSm += (m - midSm) * (1f - exp(-dt * (if (m > midSm) 20f else 4f)))
-                  hMid[head] = midSm
-                  if (hCount < HIST) hCount++
-              }
-
-              /** Index of the newest history frame that is not newer than tTarget (seconds). */
-              private fun idxAt(tTarget: Float): Int {
-                  var i = head
-                  var n = 0
-                  while (n < hCount) {
-                      if (hT[i] <= tTarget) return i
-                      i = (i - 1 + HIST) % HIST
-                      n++
-                  }
-                  return (head - hCount + 1 + HIST) % HIST
-              }
-
-              // ------------------------------------------------------------ beats
-              private fun processBeats(now: Long, dt: Float) {
-                  val headNow = AudioBus.beatHead
-                  if (headNow != lastSeen) {
-                      var i = max(lastSeen, headNow - AudioBus.QN)
-                      while (i < headNow) {
-                          val k = i % AudioBus.QN
-                          val ns = AudioBus.beatNs[k]
-                          if (now - ns < 1_500_000_000L && pendN < 16) {
-                              pendNs[pendN] = ns + Cfg.syncMs * 1_000_000L
-                              pendS[pendN] = AudioBus.beatStr[k]
-                              pendK[pendN] = AudioBus.beatKind[k]
-                              pendN++
-                          }
-                          i++
-                      }
-                      lastSeen = headNow
-                  }
-                  var j = 0
-                  while (j < pendN) {
-                      if (pendNs[j] <= now) {
-                          fireBeat(pendS[j], pendK[j])
-                          pendN--
-                          pendNs[j] = pendNs[pendN]
-                          pendS[j] = pendS[pendN]
-                          pendK[j] = pendK[pendN]
-                      } else {
-                          j++
-                      }
-                  }
-                  pop *= exp(-dt * 6.5f)
-              }
-
-              private fun fireBeat(str: Float, kind: Int) {
-                  val mult = when (kind) {
-                      1 -> 1.5f
-                      2 -> 2.1f
-                      else -> 1f
-                  }
-                  val v = str * mult
-                  if (v > pop) pop = v
-                  pendingScatter += v * Cfg.scatter
-              }
-
-              // ------------------------------------------------------------ drifting motion (no tilt)
-              private fun updateMotion(dt: Float) {
-                  val mLvl = hMid[idxAt(time - Cfg.syncMs / 1000f)]
-                  val dm = mLvl - midPrev
-                  midPrev = mLvl
-                  val mv = Cfg.midMove
-                  if (dm > 0.05f && mv > 0f) {
-                      val ang = Random.nextFloat() * 2f * PIF
-                      val mag = dm * mv
-                      mvx += cos(ang) * mag * 2.8f * uu
-                      mvy += sin(ang) * mag * 2.8f * uu
-                  }
-                  mvx += (-12f * mx - 4.5f * mvx) * dt
-                  mvy += (-12f * my - 4.5f * mvy) * dt
-                  mx = (mx + mvx * dt).coerceIn(-0.25f * uu, 0.25f * uu)
-                  my = (my + mvy * dt).coerceIn(-0.25f * uu, 0.25f * uu)
-
-                  // slow random drift on top (sums of unrelated sines), scaled by mid loudness
-                  val wx = (sin(time * 0.61f + 1.3f) + 0.6f * sin(time * 1.07f + 4.2f)) * 0.5f
-                  val wy = (sin(time * 0.53f + 2.1f) + 0.6f * sin(time * 0.91f + 0.4f)) * 0.5f
-                  val amp = mLvl * mv
-                  ox = mx + wx * uu * 0.10f * amp
-                  oy = my + wy * uu * 0.10f * amp
-
-                  hOx[head] = ox
-                  hOy[head] = oy
-                  hPop[head] = pop
-              }
-
-              // ------------------------------------------------------------ particles
-              // They wander slowly. A beat SHOOTS the ones near the center outward (no spring back);
-              // once a particle leaves the view it is gone, and a new one fades in somewhere else.
-              private fun spawn(i: Int, w: Float, h: Float, first: Boolean) {
-                  var x = 0f
-                  var y = 0f
-                  for (t in 0 until 6) {
-                      x = Random.nextFloat() * w
-                      y = Random.nextFloat() * h
-                      val dx = x - cx
-                      val dy = y - cy
-                      if (dx * dx + dy * dy > 0.49f * uu * uu) break
-                  }
-                  px[i] = x; py[i] = y
-                  pvx[i] = 0f; pvy[i] = 0f
-                  pa[i] = if (first) 1f else 0f
-              }
-
-              private fun drawParticles(canvas: Canvas, w: Float, h: Float, dt: Float) {
-                  if (!pInit) {
-                      for (i in 0 until MAXP) spawn(i, w, h, true)
-                      pInit = true
-                  }
-                  val n = Cfg.pCount.coerceIn(10, MAXP)
-                  val imp = pendingScatter
-                  pendingScatter = 0f
-                  val be = hEn[idxAt(time - Cfg.syncMs / 1000f)]
-                  val rum = Cfg.pRumble * be * 2.2f
-                  val sizeMul = Cfg.pSize
-                  val relax = 1f - exp(-dt * 0.7f)
-                  val margin = 40f * dens
-
-                  for (i in 0 until n) {
-                      val dx = px[i] - cx
-                      val dy = py[i] - cy
-                      val dist = sqrt(dx * dx + dy * dy) + 1f
-                      val ux = dx / dist
-                      val uy = dy / dist
-                      val infl = 1f / (1f + dist / (0.9f * uu))
-
-                      // beat: shoot away from the center
-                      if (imp > 0f) {
-                          val k = imp * 1100f * dens * (0.5f + pjit[i]) * infl
-                          pvx[i] += ux * k
-                          pvy[i] += uy * k
-                      }
-                      // gentle wandering, kicked speed slowly eases back to it
-                      val dvx = cos(time * 0.35f + pph[i] * 2f) * pspd[i] * 90f * dens
-                      val dvy = sin(time * 0.28f + pph[i] * 3f) * pspd[i] * 70f * dens
-                      pvx[i] += (dvx - pvx[i]) * relax
-                      pvy[i] += (dvy - pvy[i]) * relax
-                      px[i] += pvx[i] * dt
-                      py[i] += pvy[i] * dt
-
-                      // out of view -> gone, reappears from nowhere
-                      if (px[i] < -margin || px[i] > w + margin || py[i] < -margin || py[i] > h + margin) {
-                          spawn(i, w, h, false)
-                          continue
-                      }
-                      if (pa[i] < 1f) pa[i] = min(1f, pa[i] + dt * 0.8f)
-
-                      val osc = sin(time * (14f + pjit[i] * 10f) + pph[i] * 3f)
-                      val off = rum * 14f * dens * osc * infl
-                      val perp = rum * 4f * dens * sin(time * 23f + pph[i] * 5f) * infl
-                      val x = px[i] + ux * off - uy * perp
-                      val y = py[i] + uy * off + ux * perp
-
-                      val tw = 0.5f + 0.5f * sin(time * ptw[i] + pph[i])
-                      val a = ((0.15f + 0.5f * tw + energy * 0.35f + pop * 0.25f) * pa[i]).coerceIn(0f, 1f)
-                      val r = psz[i] * dens * 0.5f * sizeMul * (1f + be * 0.5f)
-                      if (psz[i] > 1.6f) {
-                          dot.alpha = (a * 70f).toInt()
-                          canvas.drawCircle(x, y, r * 2.6f, dot)
-                      }
-                      dot.alpha = (a * 255f).toInt()
-                      canvas.drawCircle(x, y, r, dot)
+              fun list(ctx: Context): List<VizItem> {
+                  val files = dir(ctx).listFiles { f -> f.isFile && f.name.endsWith(".html") } ?: return emptyList()
+                  return files.sortedByDescending { it.lastModified() }.map {
+                      val n = try { parseName(it.readText()) } catch (e: Exception) { "Visualizer" }
+                      VizItem(it.name, n)
                   }
               }
 
-              // ------------------------------------------------------------ disc + flanges
-              private fun drawRings(canvas: Canvas) {
-                  val pulse = 1f + 0.04f * energy
-                  val fo = Cfg.flOffset
-                  val glowBase = (0.6f + 0.8f * energy + 0.5f * pop) * Cfg.flGlow
-                  val reach = Cfg.arcHeight
-                  val inset = 10f * dens
+              fun read(ctx: Context, id: String): String? =
+                  try { File(dir(ctx), File(id).name).readText() } catch (e: Exception) { null }
 
-                  // outermost flange first, main black disc last (on top)
-                  for (l in 3 downTo 0) {
-                      val lag = l * Cfg.flDelay / 1000f
-                      val hh = hist[idxAt(time - Cfg.syncMs / 1000f - lag)]
-                      val pi = idxAt(time - lag)
-                      val lp = if (l == 0) pop else hPop[pi]
-                      val scale = 1f + (0.16f * lp * Cfg.popStrength).coerceAtMost(0.5f)
+              /** Same name = replaces the old one (so you can update a visualizer). */
+              fun add(ctx: Context, html: String): VizItem {
+                  val name = parseName(html)
+                  val old = list(ctx).firstOrNull { it.name == name }
+                  val id = old?.id ?: ("v" + System.currentTimeMillis() + ".html")
+                  File(dir(ctx), id).writeText(html)
+                  return VizItem(id, name)
+              }
 
-                      // position offset: flanges trail the current center
-                      val ccx = cx + ox + (hOx[pi] - ox) * fo
-                      val ccy = cy + oy + (hOy[pi] - oy) * fo
+              fun delete(ctx: Context, id: String) {
+                  try { File(dir(ctx), File(id).name).delete() } catch (e: Exception) { }
+              }
 
-                      path.reset()
-                      for (k in 0 until POINTS) {
-                          val a = (k.toFloat() / POINTS) * 2f * PIF
-                          // a = 0 is the bottom, a = PI is the top. Both halves use the same 0..PI ramp (mirror).
-                          // t = 0 at the bottom (low Hz) -> 1 at the top (high Hz)
-                          val t = if (a <= PIF) a / PIF else (2f * PIF - a) / PIF
-                          val bp = t * (nb - 1)
-                          val i0 = min(floor(bp).toInt(), nb - 2)
-                          val fr = bp - i0
-                          val s = fr * fr * (3f - 2f * fr)
-                          val v = hh[i0] + (hh[i0 + 1] - hh[i0]) * s
-                          // flanges sit slightly inside the disc, so only their arcs (and arc glow) show
-                          val r = uu * scale * (BASE_R * pulse + ARC[l] * reach * v) - (if (l > 0) inset else 0f)
-                          val x = ccx + r * sin(a)
-                          val y = ccy + r * cos(a)
-                          if (k == 0) path.moveTo(x, y) else path.lineTo(x, y)
-                      }
-                      path.close()
-                      if (WHITE[l]) {
-                          for (g in 0..2) {
-                              glow.color = Color.WHITE
-                              glow.alpha = ((46 - g * 13) * glowBase).toInt().coerceIn(0, 255)
-                              glow.strokeWidth = (5f + g * 7f) * dens
-                              canvas.drawPath(path, glow)
-                          }
-                          canvas.drawPath(path, fillWhite)
-                      } else {
-                          canvas.drawPath(path, fillBlack)
-                      }
+              private const val SHIM = """<script>(function(){var N=window.GreyPulseNative;var G=window.GreyPulse={levels:[0,0,0,0,0,0,0,0,0,0,0,0],mid:0,bpm:0,playing:false,pos:0,dur:0,title:"",artist:"",onBeat:null,onTrack:null,play:function(){N.cmd("play",0)},pause:function(){N.cmd("pause",0)},toggle:function(){N.cmd("toggle",0)},next:function(){N.cmd("next",0)},prev:function(){N.cmd("prev",0)},seek:function(f){N.cmd("seek",f)},hideUi:function(){N.cmd("ui",0)},showUi:function(){N.cmd("ui",1)},_u:function(l,m,b,p,pos,dur){G.levels=l;G.mid=m;G.bpm=b;G.playing=p;G.pos=pos;G.dur=dur},_b:function(s,k){if(G.onBeat){try{G.onBeat(s,k)}catch(e){}}},_t:function(t,a){G.title=t;G.artist=a;if(G.onTrack){try{G.onTrack(t,a)}catch(e){}}}};})();</script>"""
+
+              /** Inject the GreyPulse object at the very start of <head> so page scripts can use it. */
+              fun wrap(html: String): String {
+                  val m = Regex("<head[^>]*>", RegexOption.IGNORE_CASE).find(html)
+                  return if (m != null) {
+                      html.substring(0, m.range.last + 1) + SHIM + html.substring(m.range.last + 1)
+                  } else {
+                      SHIM + html
                   }
               }
           }
+
+          class VizBridge(private val main: Handler, private val onCmd: (String, Float) -> Unit) {
+              @JavascriptInterface
+              fun cmd(name: String, v: Double) {
+                  main.post { onCmd(name, v.toFloat()) }
+              }
+          }
+
+          fun handleCmd(vm: PlayerVm, n: String, v: Float, ui: (Boolean) -> Unit) {
+              val c = vm.controller
+              when (n) {
+                  "play" -> c?.play()
+                  "pause" -> c?.pause()
+                  "toggle" -> vm.togglePlay()
+                  "next" -> vm.next()
+                  "prev" -> vm.prev()
+                  "seek" -> vm.seekFrac(v)
+                  "ui" -> ui(v > 0.5f)
+              }
+          }
+
+          @Composable
+          fun VizLayer(vm: PlayerVm, onUi: (Boolean) -> Unit) {
+              val html = vm.vizHtml
+              if (html == null) {
+                  Box(Modifier.fillMaxSize().background(GreyBg))
+              } else {
+                  VizWeb(vm, html, onUi)
+              }
+          }
+
+          @SuppressLint("SetJavaScriptEnabled")
+          @Composable
+          fun VizWeb(vm: PlayerVm, html: String, onUi: (Boolean) -> Unit) {
+              val ver = vm.vizVersion
+              val holder = remember { arrayOfNulls<WebView>(1) }
+              val ready = remember { booleanArrayOf(false) }
+              val uiCb by rememberUpdatedState(onUi)
+              val main = remember { Handler(Looper.getMainLooper()) }
+
+              // pushes audio data into the page every frame
+              LaunchedEffect(ver) {
+                  var lastHead = AudioBus.beatHead
+                  var sentTitle = ""
+                  while (true) {
+                      withFrameMillis { }
+                      val wv = holder[0] ?: continue
+                      if (!ready[0]) {
+                          sentTitle = ""
+                          lastHead = AudioBus.beatHead
+                          continue
+                      }
+                      val now = System.nanoTime()
+                      val fresh = vm.isPlaying && (now - AudioBus.lastUpdateNs) < 250_000_000L
+
+                      val sb = StringBuilder(220)
+                      sb.append("window.GreyPulse&&GreyPulse._u([")
+                      for (i in 0 until AudioBus.BANDS) {
+                          if (i > 0) sb.append(',')
+                          if (fresh) sb.append((AudioBus.levels[i] * 1000f).roundToInt() / 1000f) else sb.append('0')
+                      }
+                      sb.append("],")
+                      if (fresh) sb.append((AudioBus.mid * 1000f).roundToInt() / 1000f) else sb.append('0')
+                      sb.append(',')
+                      sb.append(if (fresh) AudioBus.bpm.roundToInt() else 0)
+                      sb.append(',')
+                      sb.append(if (vm.isPlaying) "true" else "false")
+                      sb.append(',').append(vm.posMs).append(',').append(vm.durMs).append(')')
+                      wv.evaluateJavascript(sb.toString(), null)
+
+                      val tk = vm.title + "|" + vm.artist
+                      if (tk != sentTitle) {
+                          sentTitle = tk
+                          wv.evaluateJavascript(
+                              "window.GreyPulse&&GreyPulse._t(" + JSONObject.quote(vm.title) + "," +
+                                  JSONObject.quote(vm.artist) + ")", null
+                          )
+                      }
+
+                      val head = AudioBus.beatHead
+                      if (head != lastHead) {
+                          var i = maxOf(lastHead, head - AudioBus.QN)
+                          while (i < head) {
+                              val k = i % AudioBus.QN
+                              val bns = AudioBus.beatNs[k]
+                              if (now - bns < 1_500_000_000L) {
+                                  val js = "window.GreyPulse&&GreyPulse._b(" + AudioBus.beatStr[k] + "," +
+                                      AudioBus.beatKind[k] + ")"
+                                  val wait = ((bns + SYNC_MS * 1_000_000L - now) / 1_000_000L).coerceAtLeast(0L)
+                                  main.postDelayed({ wv.evaluateJavascript(js, null) }, wait)
+                              }
+                              i++
+                          }
+                          lastHead = head
+                      }
+                  }
+              }
+
+              AndroidView(
+                  modifier = Modifier.fillMaxSize(),
+                  factory = { c ->
+                      WebView(c).apply {
+                          setBackgroundColor(android.graphics.Color.BLACK)
+                          settings.javaScriptEnabled = true
+                          settings.domStorageEnabled = true
+                          settings.mediaPlaybackRequiresUserGesture = false
+                          settings.allowFileAccess = false
+                          settings.allowContentAccess = false
+                          webChromeClient = WebChromeClient()
+                          webViewClient = object : WebViewClient() {
+                              override fun onPageFinished(view: WebView?, url: String?) {
+                                  ready[0] = true
+                              }
+                          }
+                          addJavascriptInterface(
+                              VizBridge(main) { n, v -> handleCmd(vm, n, v, uiCb) },
+                              "GreyPulseNative"
+                          )
+                          holder[0] = this
+                      }
+                  },
+                  update = { wv ->
+                      if (wv.tag != ver) {
+                          wv.tag = ver
+                          ready[0] = false
+                          wv.loadDataWithBaseURL("https://greypulse.app/", VizStore.wrap(html), "text/html", "utf-8", null)
+                      }
+                  },
+                  onRelease = { wv ->
+                      holder[0] = null
+                      wv.removeJavascriptInterface("GreyPulseNative")
+                      wv.destroy()
+                  }
+              )
+          }
+
+          const val GUIDE = """GREYPULSE VISUALIZER GUIDE
+          (Give this whole text to any AI, then describe the visualizer you want.)
+
+          WHAT THIS IS
+          GreyPulse is a music player app. A visualizer is ONE self-contained HTML file (HTML + CSS + JavaScript, all inline). The app shows it full screen behind the player and feeds it live audio data every frame. The visualizer can also control the player and can hide the app's own buttons so the page owns the whole screen.
+
+          RULES FOR THE FILE
+          1. Reply with ONE complete HTML file only, in a single code block.
+          2. Everything inline in that one file. No external files. No libraries unless the user asks (a CDN script only works with internet).
+          3. NAME (required): inside <head> put this line with a short name (2 to 4 words):
+             <meta name="greypulse-name" content="Neon Rings">
+             The app reads it to name the visualizer in its list. If it is missing the app uses <title>, then "Visualizer". Using the same name again replaces the old one (that is how you update a visualizer).
+          4. Full screen on a portrait phone: html, body {margin:0; height:100%; overflow:hidden; background:#000}. Use a canvas sized to innerWidth/innerHeight, handle resize and devicePixelRatio.
+          5. Touch only (no mouse or keyboard). Use pointer or touch events and touch-action:none on interactive things. Buttons and sliders must be big (at least 44px).
+          6. Must be smooth on a phone: use requestAnimationFrame and avoid heavy allocations per frame.
+          7. Must not crash when GreyPulse is missing (testing in a normal browser):
+             var G = window.GreyPulse || {levels:[],mid:0,bpm:0,playing:false,pos:0,dur:0,title:"",artist:""};
+
+          AUDIO DATA (global object GreyPulse, updated every frame, just read it inside your requestAnimationFrame loop)
+          GreyPulse.levels  array of 12 numbers 0..1 = bass spectrum. Index 0 = 16 Hz ... index 11 = 60 Hz.
+          GreyPulse.mid     number 0..1 = loudness of 1 kHz to 4 kHz.
+          GreyPulse.bpm     estimated tempo (0 when unknown).
+          GreyPulse.playing true or false.
+          GreyPulse.pos / GreyPulse.dur   position and duration of the song in milliseconds.
+          GreyPulse.title / GreyPulse.artist   strings.
+          The values are raw. Smooth them yourself (fast attack, slow decay) and apply your own gain.
+
+          CALLBACKS (assign a function)
+          GreyPulse.onBeat = function(strength, kind){}   strength 0.3 to 1. kind: 0 = beat, 1 = start of a bar, 2 = every 8th bar. Good for pops, flashes, particle kicks.
+          GreyPulse.onTrack = function(title, artist){}   called when the song changes.
+
+          CONTROLS (call these from your own buttons or touch gestures)
+          GreyPulse.toggle()  play or pause      GreyPulse.play()    GreyPulse.pause()
+          GreyPulse.next()    GreyPulse.prev()
+          GreyPulse.seek(f)   f = 0..1 position in the song
+          GreyPulse.hideUi()  hides the app's own top bar and bottom controls. Then your page gets every touch and must draw its own controls. The user can press the phone Back button to bring the app controls back.
+          GreyPulse.showUi()  shows them again.
+
+          TIPS
+          - A visualizer can be made of the canvas plus its own control panel (sliders, toggles, color pickers) drawn in HTML. Store settings in localStorage if the user wants them remembered.
+          - When the app UI is visible the page only gets touches in the empty middle area, so keep important touch areas there, or call hideUi().
+          - Keep colors high contrast on a dark background unless asked otherwise.
+
+          MINIMAL COMPLETE EXAMPLE
+          <!DOCTYPE html>
+          <html><head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+          <meta name="greypulse-name" content="Simple Bars">
+          <title>Simple Bars</title>
+          <style>html,body{margin:0;height:100%;overflow:hidden;background:#000}canvas{display:block}</style>
+          </head><body><canvas id="c"></canvas>
+          <script>
+          var G = window.GreyPulse || {levels:[],mid:0,playing:false};
+          var cv = document.getElementById("c"), cx = cv.getContext("2d"), W, H, sm = [], pop = 0;
+          function fit(){var d=window.devicePixelRatio||1;W=innerWidth;H=innerHeight;cv.width=W*d;cv.height=H*d;cx.setTransform(d,0,0,d,0,0);}
+          addEventListener("resize",fit);fit();
+          G.onBeat = function(s,k){pop=Math.max(pop,s);};
+          function draw(){
+            cx.fillStyle="#000";cx.fillRect(0,0,W,H);
+            var L=G.levels,n=12,bw=W/n;
+            for(var i=0;i<n;i++){
+              var v=L[i]||0,p=sm[i]||0;
+              sm[i]=p+(v-p)*(v>p?0.6:0.1);
+              var h=sm[i]*H*0.5*(1+pop*0.3);
+              cx.fillStyle="#fff";cx.fillRect(i*bw+4,H/2-h/2,bw-8,Math.max(h,2));
+            }
+            pop*=0.9;requestAnimationFrame(draw);
+          }
+          draw();
+          </script></body></html>
+          """
           KOTLIN_EOF
 
-          cat > app/src/main/java/com/grey/pulse/MainActivity.kt << 'KOTLIN_EOF'
-          package com.grey.pulse
+          cat > app/src/main/java/com/grey/pulsex/MainActivity.kt << 'KOTLIN_EOF'
+          package com.grey.pulsex
 
           import android.Manifest
+          import android.content.ClipData
+          import android.content.ClipboardManager
           import android.content.ComponentName
           import android.content.Context
           import android.content.pm.PackageManager
@@ -1263,8 +1064,6 @@ jobs:
           import androidx.compose.foundation.background
           import androidx.compose.foundation.border
           import androidx.compose.foundation.clickable
-          import androidx.compose.foundation.gestures.awaitEachGesture
-          import androidx.compose.foundation.gestures.awaitFirstDown
           import androidx.compose.foundation.gestures.detectHorizontalDragGestures
           import androidx.compose.foundation.gestures.detectTapGestures
           import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -1285,11 +1084,13 @@ jobs:
           import androidx.compose.foundation.lazy.LazyColumn
           import androidx.compose.foundation.lazy.items
           import androidx.compose.foundation.lazy.itemsIndexed
+          import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.shape.CircleShape
           import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.foundation.text.BasicTextField
           import androidx.compose.foundation.text.KeyboardActions
           import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.foundation.verticalScroll
           import androidx.compose.material3.MaterialTheme
           import androidx.compose.material3.Text
           import androidx.compose.material3.darkColorScheme
@@ -1321,6 +1122,7 @@ jobs:
           import androidx.compose.ui.layout.onSizeChanged
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontFamily
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.text.input.ImeAction
           import androidx.compose.ui.text.input.KeyboardType
@@ -1330,7 +1132,6 @@ jobs:
           import androidx.compose.ui.unit.IntOffset
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
-          import androidx.compose.ui.viewinterop.AndroidView
           import androidx.core.content.ContextCompat
           import androidx.media3.common.C
           import androidx.media3.common.MediaItem
@@ -1347,7 +1148,7 @@ jobs:
 
           // ---------------------------------------------------------------- colors
           private val CText = Color(0xFFF5F5F7)
-          private val CDim = Color(0xFF8F8F99)
+          private val CDim = Color(0xFF9A9AA4)
           private val CSurf2 = Color(0xFF33333A)
           private val CSurf3 = Color(0xFF44444C)
           private val CHeart = Color(0xFFFF6B81)
@@ -1373,7 +1174,7 @@ jobs:
           // ---------------------------------------------------------------- data
           data class Track(val id: Long, val title: String, val artist: String, val durMs: Long, val uri: Uri)
 
-          enum class Panel { None, List, Menu, Eq, Viz }
+          enum class Panel { None, List, Menu, Eq, VizList, VizAdd, Guide }
 
           fun scanTracks(ctx: Context): List<Track> {
               val list = ArrayList<Track>()
@@ -1413,7 +1214,7 @@ jobs:
           class PlayerVm(val app: Context, val scope: CoroutineScope) {
               var tracks by mutableStateOf(listOf<Track>())
               var nowId by mutableStateOf("")
-              var title by mutableStateOf("GreyPulse")
+              var title by mutableStateOf("GreyPulseX")
               var artist by mutableStateOf("Menu > Scan Files to find songs")
               var isPlaying by mutableStateOf(false)
               var hasQueue by mutableStateOf(false)
@@ -1421,9 +1222,13 @@ jobs:
               var durMs by mutableLongStateOf(0L)
               var eqOn by mutableStateOf(false)
               var eqBands by mutableStateOf(listOf<EqBand>())
+              var vizList by mutableStateOf(listOf<VizItem>())
+              var vizSel by mutableStateOf("")
+              var vizHtml by mutableStateOf<String?>(null)
+              var vizVersion by mutableStateOf(0)
               var controller: MediaController? = null
 
-              private val prefs = app.getSharedPreferences("pulse", Context.MODE_PRIVATE)
+              private val prefs = app.getSharedPreferences("pulsex", Context.MODE_PRIVATE)
 
               private val listener = object : Player.Listener {
                   override fun onEvents(player: Player, events: Player.Events) {
@@ -1433,17 +1238,35 @@ jobs:
 
               init {
                   loadEq()
-                  Cfg.load(prefs)
+                  loadViz()
               }
 
-              fun saveCfg() {
-                  Cfg.rangeVersion++
-                  Cfg.save(prefs)
+              // ---- visualizers
+              private fun loadViz() {
+                  vizList = VizStore.list(app)
+                  val s = prefs.getString("viz_sel", "") ?: ""
+                  applyViz(if (vizList.any { it.id == s }) s else "")
               }
 
-              fun resetCfg() {
-                  Cfg.reset()
-                  saveCfg()
+              fun applyViz(id: String) {
+                  vizSel = id
+                  prefs.edit().putString("viz_sel", id).apply()
+                  vizHtml = if (id.isEmpty()) null else VizStore.read(app, id)
+                  vizVersion++
+                  AudioBus.analyzeOn = vizHtml != null
+              }
+
+              fun addViz(html: String): VizItem {
+                  val item = VizStore.add(app, html)
+                  vizList = VizStore.list(app)
+                  if (item.id == vizSel) applyViz(item.id)
+                  return item
+              }
+
+              fun removeViz(id: String) {
+                  VizStore.delete(app, id)
+                  vizList = VizStore.list(app)
+                  if (vizSel == id) applyViz("")
               }
 
               fun attach(c: MediaController) {
@@ -1540,7 +1363,7 @@ jobs:
               fun seekFrac(f: Float) {
                   val c = controller ?: return
                   if (durMs <= 0) return
-                  val p = (f * durMs).toLong()
+                  val p = (f.coerceIn(0f, 1f) * durMs).toLong()
                   c.seekTo(p)
                   posMs = p
               }
@@ -1563,9 +1386,14 @@ jobs:
                   }
               }
 
-              // ---- equalizer persistence
+              // ---- equalizer persistence (first run = default bands, all flat; you can delete any)
               private fun loadEq() {
                   eqOn = prefs.getBoolean("on", false)
+                  if (!prefs.contains("bands")) {
+                      eqBands = listOf(33, 60, 150, 230, 910, 3600, 14000, 16000, 20000).map { EqBand(it, 0) }
+                      pushEq()
+                      return
+                  }
                   val s = prefs.getString("bands", "") ?: ""
                   eqBands = s.split(",").mapNotNull { p ->
                       val kv = p.split(":")
@@ -1661,6 +1489,11 @@ jobs:
           }
 
           @Composable
+          fun IconAddViz() = Ico(20.dp) {
+              ln(Color.White, 12f, 4f, 12f, 20f, 2.2f); ln(Color.White, 4f, 12f, 20f, 12f, 2.2f)
+          }
+
+          @Composable
           fun IconScan() = Ico(20.dp) {
               val c = Color.White
               ln(c, 3f, 7f, 3f, 3f, 2f); ln(c, 3f, 3f, 7f, 3f, 2f)
@@ -1713,6 +1546,34 @@ jobs:
               }
           }
 
+          @Composable
+          fun PillBtn(
+              text: String,
+              modifier: Modifier = Modifier,
+              enabled: Boolean = true,
+              primary: Boolean = false,
+              onClick: () -> Unit
+          ) {
+              Box(
+                  modifier
+                      .height(40.dp)
+                      .alpha(if (enabled) 1f else 0.35f)
+                      .clip(RoundedCornerShape(12.dp))
+                      .background(
+                          if (primary) Brush.linearGradient(listOf(Color(0xFFF7F7FA), Color(0xFFC9C9D2)))
+                          else SolidColor(Color(0x14FFFFFF))
+                      )
+                      .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, enabled = enabled, onClick = onClick)
+                      .padding(horizontal = 14.dp),
+                  contentAlignment = Alignment.Center
+              ) {
+                  Text(
+                      text, color = if (primary) Color(0xFF0E0E10) else Color.White,
+                      fontSize = 13.sp, fontWeight = FontWeight.Bold
+                  )
+              }
+          }
+
           // ---------------------------------------------------------------- root
           @Composable
           fun PulseApp() {
@@ -1721,6 +1582,8 @@ jobs:
               val vm = remember { PlayerVm(ctx.applicationContext, scope) }
               var panel by remember { mutableStateOf(Panel.None) }
               var pendingDelete by remember { mutableStateOf<Int?>(null) }
+              var pendingViz by remember { mutableStateOf<String?>(null) }
+              var uiVisible by remember { mutableStateOf(true) }
               val manualScan = remember { booleanArrayOf(false) }
 
               val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -1739,6 +1602,14 @@ jobs:
                       manualScan[0] = false
                   } else {
                       permLauncher.launch(need.toTypedArray())
+                  }
+              }
+
+              fun back() {
+                  panel = when (panel) {
+                      Panel.Guide -> Panel.VizAdd
+                      Panel.VizAdd, Panel.VizList, Panel.Eq -> Panel.Menu
+                      else -> Panel.None
                   }
               }
 
@@ -1766,57 +1637,74 @@ jobs:
                   }
               }
 
-              BackHandler(enabled = panel != Panel.None) { panel = Panel.None }
+              BackHandler(enabled = panel != Panel.None) { back() }
+              // registered last = wins: Back brings the app controls back after a visualizer hid them
+              BackHandler(enabled = !uiVisible) { uiVisible = true }
 
-              Box(
-                  Modifier
-                      .fillMaxSize()
-                      .background(Brush.verticalGradient(listOf(Color(0xFF18181B), Color(0xFF0E0E10))))
-              ) {
-                  AndroidView(
-                      factory = { VisualizerView(it) },
-                      update = { it.playing = vm.isPlaying },
-                      modifier = Modifier.fillMaxSize()
-                  )
+              Box(Modifier.fillMaxSize().background(GreyBg)) {
+                  VizLayer(vm) { uiVisible = it; if (!it) panel = Panel.None }
 
-                  Column(Modifier.fillMaxSize()) {
-                      TopBar(
-                          vm = vm,
-                          panel = panel,
-                          onLeft = { panel = if (panel == Panel.None) Panel.List else Panel.None },
-                          onRight = { panel = Panel.Menu }
-                      )
-                      Box(Modifier.weight(1f).fillMaxWidth()) {
-                          Overlay(panel == Panel.List) {
-                              ListPanel(vm) { panel = Panel.None }
+                  if (uiVisible) {
+                      Column(Modifier.fillMaxSize()) {
+                          TopBar(
+                              vm = vm,
+                              panel = panel,
+                              onLeft = { if (panel == Panel.None) panel = Panel.List else back() },
+                              onRight = { panel = Panel.Menu }
+                          )
+                          Box(Modifier.weight(1f).fillMaxWidth()) {
+                              Overlay(panel == Panel.List) {
+                                  ListPanel(vm) { panel = Panel.None }
+                              }
+                              Overlay(panel == Panel.Menu) {
+                                  MenuPanel(
+                                      onEq = { panel = Panel.Eq },
+                                      onVizAdd = { panel = Panel.VizAdd },
+                                      onVizList = { panel = Panel.VizList },
+                                      onScan = { panel = Panel.None; requestAndScan(true) }
+                                  )
+                              }
+                              Overlay(panel == Panel.VizList) {
+                                  VizListPanel(vm, onPicked = { panel = Panel.None }, askDelete = { id -> pendingViz = id })
+                              }
+                              Overlay(panel == Panel.VizAdd) {
+                                  VizAddPanel(vm, onGuide = { panel = Panel.Guide }, onDone = { panel = Panel.VizList })
+                              }
+                              Overlay(panel == Panel.Guide) {
+                                  GuidePanel()
+                              }
+                              Overlay(panel == Panel.Eq) {
+                                  EqPanel(vm) { idx -> pendingDelete = idx }
+                              }
                           }
-                          Overlay(panel == Panel.Menu) {
-                              MenuPanel(
-                                  onEq = { panel = Panel.Eq },
-                                  onViz = { panel = Panel.Viz },
-                                  onScan = { panel = Panel.None; requestAndScan(true) }
-                              )
-                          }
-                          Overlay(panel == Panel.Viz) {
-                              VizPanel(vm)
-                          }
-                          Overlay(panel == Panel.Eq) {
-                              EqPanel(vm) { idx -> pendingDelete = idx }
-                          }
+                          Controls(vm)
                       }
-                      Controls(vm)
                   }
 
                   val pd = pendingDelete
                   if (pd != null && pd in vm.eqBands.indices) {
                       val band = vm.eqBands[pd]
                       ConfirmDelete(
-                          freq = band.freq,
+                          title = "Delete band?",
+                          msg = "Remove the " + band.freq + " Hz band from your equalizer?",
                           onCancel = { pendingDelete = null },
                           onDelete = {
                               vm.eqBands = vm.eqBands.filterIndexed { i, _ -> i != pd }
                               vm.pushEq()
                               pendingDelete = null
+                          }
+                      )
+                  }
+                  val pv = pendingViz
+                  if (pv != null) {
+                      val nm = vm.vizList.firstOrNull { it.id == pv }?.name ?: "this visualizer"
+                      ConfirmDelete(
+                          title = "Delete visualizer?",
+                          msg = "Remove \"" + nm + "\" from your list?",
+                          onCancel = { pendingViz = null },
+                          onDelete = {
+                              vm.removeViz(pv)
+                              pendingViz = null
                           }
                       )
                   }
@@ -1916,10 +1804,11 @@ jobs:
 
           // ---------------------------------------------------------------- menu
           @Composable
-          fun MenuPanel(onEq: () -> Unit, onViz: () -> Unit, onScan: () -> Unit) {
+          fun MenuPanel(onEq: () -> Unit, onVizAdd: () -> Unit, onVizList: () -> Unit, onScan: () -> Unit) {
               Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                   MenuRow("Equalizer", "Add bands and shape the sound", onEq) { IconEq() }
-                  MenuRow("Visualizer", "Arcs, flanges, motion, beat and particles", onViz) { IconViz() }
+                  MenuRow("Add Visualizer", "Paste or import an HTML visualizer", onVizAdd) { IconAddViz() }
+                  MenuRow("Visualizers", "Pick which one is on screen", onVizList) { IconViz() }
                   MenuRow("Scan Files", "Find songs on this device", onScan) { IconScan() }
               }
           }
@@ -1941,175 +1830,185 @@ jobs:
               }
           }
 
-          // ---------------------------------------------------------------- visualizer settings
-          /** Press / drag anywhere on the row: reports 0..1 across the width, and keeps the drag (no list scrolling). */
-          fun Modifier.dragX(key: Any?, onX: (Float) -> Unit): Modifier = pointerInput(key) {
-              awaitEachGesture {
-                  val down = awaitFirstDown(requireUnconsumed = false)
-                  val w = size.width.toFloat().coerceAtLeast(1f)
-                  onX((down.position.x / w).coerceIn(0f, 1f))
-                  down.consume()
-                  while (true) {
-                      val ev = awaitPointerEvent()
-                      val c = ev.changes.firstOrNull { it.id == down.id } ?: break
-                      if (!c.pressed) break
-                      onX((c.position.x / w).coerceIn(0f, 1f))
-                      c.consume()
-                  }
-              }
-          }
-
+          // ---------------------------------------------------------------- visualizers
           @Composable
-          fun SliderRow(label: String, valueText: String, frac: Float, onFrac: (Float) -> Unit) {
-              val cb by rememberUpdatedState(onFrac)
-              var wPx by remember { mutableStateOf(1f) }
-              val f = frac.coerceIn(0f, 1f)
-              Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp)) {
-                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                      Text(label, color = Color(0xCCFFFFFF), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                      Text(valueText, color = CDim, fontSize = 11.sp)
-                  }
+          fun VizRow(name: String, active: Boolean, onDelete: (() -> Unit)?, onClick: () -> Unit) {
+              Row(
+                  Modifier
+                      .fillMaxWidth()
+                      .padding(vertical = 2.dp)
+                      .clip(RoundedCornerShape(14.dp))
+                      .background(if (active) Color(0x14FFFFFF) else Color.Transparent)
+                      .tap(onClick)
+                      .padding(horizontal = 12.dp, vertical = 10.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
                   Box(
-                      Modifier
-                          .fillMaxWidth()
-                          .height(36.dp)
-                          .onSizeChanged { wPx = it.width.toFloat().coerceAtLeast(1f) }
-                          .dragX(Unit) { cb(it) },
-                      contentAlignment = Alignment.CenterStart
-                  ) {
-                      Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(99.dp)).background(CSurf3))
-                      Box(Modifier.fillMaxWidth(f).height(4.dp).clip(RoundedCornerShape(99.dp)).background(Color(0xCCFFFFFF)))
+                      Modifier.size(12.dp).clip(CircleShape)
+                          .background(if (active) CGreen else CSurf3)
+                  )
+                  Text(
+                      name, color = if (active) Color.White else CText, fontSize = 14.sp,
+                      fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                      modifier = Modifier.weight(1f).padding(horizontal = 12.dp)
+                  )
+                  if (active) Text("ON", color = CGreen, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                  if (onDelete != null) {
+                      Box(Modifier.width(8.dp))
                       Box(
-                          Modifier
-                              .offset { IntOffset((f * wPx - 7.dp.toPx()).roundToInt(), 0) }
-                              .size(14.dp).clip(CircleShape).background(Color.White)
-                      )
+                          Modifier.size(30.dp).clip(CircleShape).background(Color(0x10FFFFFF)).tap(onDelete),
+                          contentAlignment = Alignment.Center
+                      ) { Text("x", color = Color(0x99FFFFFF), fontSize = 14.sp) }
                   }
               }
           }
 
           @Composable
-          fun SectionTitle(t: String, sub: String) {
-              Column(Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, top = 16.dp, bottom = 2.dp)) {
-                  Text(t.uppercase(), color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
-                  Text(sub, color = CDim, fontSize = 10.sp)
-              }
-          }
-
-          @Composable
-          fun VizPanel(vm: PlayerVm) {
-              var tick by remember { mutableStateOf(0) }
-              val t = tick // read so the sliders redraw
-              fun changed() { tick++; vm.saveCfg() }
-
-              fun lin(v: Float, lo: Float, hi: Float) = (v - lo) / (hi - lo)
-              fun unlin(f: Float, lo: Float, hi: Float) = lo + f * (hi - lo)
-              // log scale for Hz ranges (a bit more room at the low end)
-              fun logF(v: Int, lo: Float, hi: Float) = (Math.log((v / lo).toDouble()) / Math.log((hi / lo).toDouble())).toFloat()
-              fun unlogF(f: Float, lo: Float, hi: Float) = (lo * Math.pow((hi / lo).toDouble(), f.toDouble())).roundToInt()
-
+          fun VizListPanel(vm: PlayerVm, onPicked: () -> Unit, askDelete: (String) -> Unit) {
               Column(Modifier.fillMaxSize()) {
-                  Row(
-                      Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 6.dp, bottom = 4.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
-                      Column(Modifier.weight(1f)) {
-                          Text("Visualizer", color = CText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                          Text("SETTINGS SAVE AUTOMATICALLY", color = CDim, fontSize = 10.sp, letterSpacing = 0.6.sp)
-                      }
-                      Box(
-                          Modifier.height(34.dp).clip(RoundedCornerShape(10.dp)).background(Color(0x14FFFFFF))
-                              .tap { vm.resetCfg(); tick++ }.padding(horizontal = 14.dp),
-                          contentAlignment = Alignment.Center
-                      ) { Text("Reset", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                  Column(Modifier.fillMaxWidth().padding(start = 4.dp, top = 6.dp, bottom = 10.dp)) {
+                      Text("Visualizers", color = CText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                      Text("TAP ONE TO APPLY IT", color = CDim, fontSize = 10.sp, letterSpacing = 0.6.sp)
                   }
                   LazyColumn(Modifier.weight(1f).fillMaxWidth()) {
                       item {
-                          Column(Modifier.fillMaxWidth()) {
-                              SectionTitle("Bass arcs", "Bottom of the circle = low Hz, top = high Hz, mirrored on both sides")
-                              SliderRow("Bottom (low Hz)", Cfg.bassLo.toString() + " Hz", logF(Cfg.bassLo, 1f, 60f)) {
-                                  Cfg.bassLo = unlogF(it, 1f, 60f).coerceIn(1, 60)
-                                  if (Cfg.bassHi < Cfg.bassLo + 5) Cfg.bassHi = Cfg.bassLo + 5
-                                  changed()
-                              }
-                              SliderRow("Top (high Hz)", Cfg.bassHi.toString() + " Hz", logF(Cfg.bassHi, 20f, 250f)) {
-                                  Cfg.bassHi = unlogF(it, 20f, 250f).coerceIn(20, 250)
-                                  if (Cfg.bassHi < Cfg.bassLo + 5) Cfg.bassLo = (Cfg.bassHi - 5).coerceAtLeast(1)
-                                  changed()
-                              }
-                              SliderRow("Sensitivity", "%.2fx".format(Cfg.arcSens), lin(Cfg.arcSens, 0.2f, 3f)) {
-                                  Cfg.arcSens = unlin(it, 0.2f, 3f); changed()
-                              }
-                              SliderRow("Arc height", "%.2fx".format(Cfg.arcHeight), lin(Cfg.arcHeight, 0.3f, 2f)) {
-                                  Cfg.arcHeight = unlin(it, 0.3f, 2f); changed()
-                              }
-                              SliderRow("Note focus", (Cfg.noteFocus * 100).roundToInt().toString() + "%", Cfg.noteFocus) {
-                                  Cfg.noteFocus = it; changed()
-                              }
-                              SliderRow("Noise gate", (Cfg.gate * 100).roundToInt().toString() + "%", lin(Cfg.gate, 0f, 0.6f)) {
-                                  Cfg.gate = unlin(it, 0f, 0.6f); changed()
-                              }
-                              SliderRow("Smoothness", (Cfg.smooth * 100).roundToInt().toString() + "%", Cfg.smooth) {
-                                  Cfg.smooth = it; changed()
-                              }
-
-                              SectionTitle("Flanges", "White glow, black, white glow trailing the black center")
-                              SliderRow("Delay per flange", Cfg.flDelay.toString() + " ms", lin(Cfg.flDelay.toFloat(), 0f, 250f)) {
-                                  Cfg.flDelay = unlin(it, 0f, 250f).roundToInt(); changed()
-                              }
-                              SliderRow("Position offset", "%.2fx".format(Cfg.flOffset), lin(Cfg.flOffset, 0f, 4f)) {
-                                  Cfg.flOffset = unlin(it, 0f, 4f); changed()
-                              }
-                              SliderRow("Glow", "%.2fx".format(Cfg.flGlow), lin(Cfg.flGlow, 0f, 2f)) {
-                                  Cfg.flGlow = unlin(it, 0f, 2f); changed()
-                              }
-
-                              SectionTitle("Mid motion (drift)", "The whole circle drifts with this range")
-                              SliderRow("Low end", Cfg.midLo.toString() + " Hz", logF(Cfg.midLo, 200f, 6000f)) {
-                                  Cfg.midLo = unlogF(it, 200f, 6000f).coerceIn(200, 6000)
-                                  if (Cfg.midHi < Cfg.midLo + 200) Cfg.midHi = Cfg.midLo + 200
-                                  changed()
-                              }
-                              SliderRow("High end", Cfg.midHi.toString() + " Hz", logF(Cfg.midHi, 400f, 12000f)) {
-                                  Cfg.midHi = unlogF(it, 400f, 12000f).coerceIn(400, 12000)
-                                  if (Cfg.midHi < Cfg.midLo + 200) Cfg.midLo = (Cfg.midHi - 200).coerceAtLeast(200)
-                                  changed()
-                              }
-                              SliderRow("Sensitivity", "%.2fx".format(Cfg.midSens), lin(Cfg.midSens, 0.2f, 3f)) {
-                                  Cfg.midSens = unlin(it, 0.2f, 3f); changed()
-                              }
-                              SliderRow("Movement amount", "%.2fx".format(Cfg.midMove), lin(Cfg.midMove, 0f, 2f)) {
-                                  Cfg.midMove = unlin(it, 0f, 2f); changed()
-                              }
-
-                              SectionTitle("Beat", "Center pops bigger, particles scatter away")
-                              SliderRow("Detection sensitivity", "%.2fx".format(Cfg.beatSens), lin(Cfg.beatSens, 0.3f, 3f)) {
-                                  Cfg.beatSens = unlin(it, 0.3f, 3f); changed()
-                              }
-                              SliderRow("Pop strength", "%.2fx".format(Cfg.popStrength), lin(Cfg.popStrength, 0f, 2.5f)) {
-                                  Cfg.popStrength = unlin(it, 0f, 2.5f); changed()
-                              }
-                              SliderRow("Scatter strength", "%.2fx".format(Cfg.scatter), lin(Cfg.scatter, 0f, 3f)) {
-                                  Cfg.scatter = unlin(it, 0f, 3f); changed()
-                              }
-                              SliderRow("Sync offset", Cfg.syncMs.toString() + " ms", lin(Cfg.syncMs.toFloat(), 0f, 400f)) {
-                                  Cfg.syncMs = unlin(it, 0f, 400f).roundToInt(); changed()
-                              }
-
-                              SectionTitle("Particles", "")
-                              SliderRow("Size", "%.2fx".format(Cfg.pSize), lin(Cfg.pSize, 0.3f, 3f)) {
-                                  Cfg.pSize = unlin(it, 0.3f, 3f); changed()
-                              }
-                              SliderRow("Rumble sensitivity", "%.2fx".format(Cfg.pRumble), lin(Cfg.pRumble, 0f, 3f)) {
-                                  Cfg.pRumble = unlin(it, 0f, 3f); changed()
-                              }
-                              SliderRow("Density", Cfg.pCount.toString(), lin(Cfg.pCount.toFloat(), 10f, 600f)) {
-                                  Cfg.pCount = unlin(it, 10f, 600f).roundToInt(); changed()
-                              }
-                              Box(Modifier.height(20.dp))
+                          VizRow("None (grey background)", vm.vizSel.isEmpty(), null) {
+                              vm.applyViz(""); onPicked()
+                          }
+                      }
+                      items(vm.vizList, key = { it.id }) { v ->
+                          VizRow(v.name, vm.vizSel == v.id, { askDelete(v.id) }) {
+                              vm.applyViz(v.id); onPicked()
+                          }
+                      }
+                      if (vm.vizList.isEmpty()) {
+                          item {
+                              Text(
+                                  "No visualizers yet.\nMenu > Add Visualizer to paste or import one.",
+                                  color = CDim, fontSize = 12.sp, textAlign = TextAlign.Center, lineHeight = 18.sp,
+                                  modifier = Modifier.fillMaxWidth().padding(26.dp)
+                              )
                           }
                       }
                   }
+              }
+          }
+
+          @Composable
+          fun VizAddPanel(vm: PlayerVm, onGuide: () -> Unit, onDone: () -> Unit) {
+              val ctx = LocalContext.current
+              var draft by remember { mutableStateOf("") }
+              val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  if (uri != null) {
+                      try {
+                          val bytes = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                          if (bytes != null && bytes.size <= 4_000_000) {
+                              draft = String(bytes, Charsets.UTF_8)
+                          } else {
+                              Toast.makeText(ctx, "File too big or unreadable", Toast.LENGTH_SHORT).show()
+                          }
+                      } catch (e: Exception) {
+                          Toast.makeText(ctx, "Could not read the file", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+              }
+              fun paste() {
+                  val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                  val clip = cm.primaryClip
+                  val t = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(ctx).toString() else ""
+                  if (t.isBlank()) Toast.makeText(ctx, "Clipboard is empty", Toast.LENGTH_SHORT).show() else draft = t
+              }
+              val has = draft.isNotBlank() && draft.contains("<")
+              val name = if (has) VizStore.parseName(draft) else ""
+
+              Column(Modifier.fillMaxSize()) {
+                  Row(
+                      Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 6.dp, bottom = 12.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Column(Modifier.weight(1f)) {
+                          Text("Add Visualizer", color = CText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                          Text("PASTE OR IMPORT ONE HTML FILE", color = CDim, fontSize = 10.sp, letterSpacing = 0.6.sp)
+                      }
+                      Box(
+                          Modifier.size(36.dp).clip(CircleShape).background(Color(0x1AFFFFFF)).tap(onGuide),
+                          contentAlignment = Alignment.Center
+                      ) { Text("?", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold) }
+                  }
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      PillBtn("Paste", Modifier.weight(1f)) { paste() }
+                      PillBtn("Import file", Modifier.weight(1f)) { picker.launch("*/*") }
+                      PillBtn("Clear", Modifier.weight(1f), enabled = draft.isNotEmpty()) { draft = "" }
+                  }
+                  Box(Modifier.height(12.dp))
+                  Column(
+                      Modifier
+                          .weight(1f)
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(12.dp))
+                          .background(Color(0x10FFFFFF))
+                          .border(1.dp, Color(0x1AFFFFFF), RoundedCornerShape(12.dp))
+                          .verticalScroll(rememberScrollState())
+                          .padding(12.dp)
+                  ) {
+                      if (draft.isEmpty()) {
+                          Text(
+                              "Nothing yet.\nTap ? for the guide you can give to any AI, copy the HTML it makes, then tap Paste.",
+                              color = CDim, fontSize = 12.sp, lineHeight = 18.sp
+                          )
+                      } else {
+                          Text(
+                              "Name: " + (if (has) name else "(not HTML?)") + "   " + (draft.length / 1024 + 1) + " KB",
+                              color = if (has) CGreen else CHeart, fontSize = 12.sp, fontWeight = FontWeight.Bold
+                          )
+                          Box(Modifier.height(8.dp))
+                          Text(
+                              draft.take(1500) + (if (draft.length > 1500) "\n..." else ""),
+                              color = CDim, fontSize = 10.sp, lineHeight = 14.sp, fontFamily = FontFamily.Monospace
+                          )
+                      }
+                  }
+                  Box(Modifier.height(10.dp))
+                  PillBtn("Add to list", Modifier.fillMaxWidth(), enabled = has, primary = true) {
+                      val item = vm.addViz(draft)
+                      Toast.makeText(ctx, "Added: " + item.name, Toast.LENGTH_SHORT).show()
+                      draft = ""
+                      onDone()
+                  }
+                  Box(Modifier.height(8.dp))
+              }
+          }
+
+          @Composable
+          fun GuidePanel() {
+              val ctx = LocalContext.current
+              Column(Modifier.fillMaxSize()) {
+                  Row(
+                      Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 6.dp, bottom = 12.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Column(Modifier.weight(1f)) {
+                          Text("Guide for AI", color = CText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                          Text("COPY IT AND GIVE IT TO ANY AI", color = CDim, fontSize = 10.sp, letterSpacing = 0.6.sp)
+                      }
+                      PillBtn("Copy guide", primary = true) {
+                          val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("GreyPulse guide", GUIDE))
+                          Toast.makeText(ctx, "Guide copied", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+                  Column(
+                      Modifier
+                          .weight(1f)
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(12.dp))
+                          .background(Color(0x10FFFFFF))
+                          .verticalScroll(rememberScrollState())
+                          .padding(12.dp)
+                  ) {
+                      Text(GUIDE, color = Color(0xCCFFFFFF), fontSize = 11.sp, lineHeight = 16.sp, fontFamily = FontFamily.Monospace)
+                  }
+                  Box(Modifier.height(8.dp))
               }
           }
 
@@ -2277,7 +2176,17 @@ jobs:
                           .weight(1f)
                           .height(32.dp)
                           .onSizeChanged { wPx = it.width.toFloat().coerceAtLeast(1f) }
-                          .dragX(enabled) { if (enabled) cb(gainFor(it, 1f)) },
+                          .pointerInput(enabled) {
+                              if (!enabled) return@pointerInput
+                              detectTapGestures { o -> cb(gainFor(o.x, wPx)) }
+                          }
+                          .pointerInput(enabled) {
+                              if (!enabled) return@pointerInput
+                              detectHorizontalDragGestures(
+                                  onDragStart = { o -> cb(gainFor(o.x, wPx)) },
+                                  onHorizontalDrag = { ch, _ -> cb(gainFor(ch.position.x, wPx)) }
+                              )
+                          },
                       contentAlignment = Alignment.CenterStart
                   ) {
                       Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(99.dp)).background(CSurf3))
@@ -2311,7 +2220,7 @@ jobs:
           }
 
           @Composable
-          fun ConfirmDelete(freq: Int, onCancel: () -> Unit, onDelete: () -> Unit) {
+          fun ConfirmDelete(title: String, msg: String, onCancel: () -> Unit, onDelete: () -> Unit) {
               Box(
                   Modifier
                       .fillMaxSize()
@@ -2335,10 +2244,10 @@ jobs:
                           contentAlignment = Alignment.Center
                       ) { IconTrash() }
                       Box(Modifier.height(14.dp))
-                      Text("Delete band?", color = CText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                      Text(title, color = CText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                       Box(Modifier.height(6.dp))
                       Text(
-                          "Remove the " + freq + " Hz band from your equalizer?",
+                          msg,
                           color = CDim, fontSize = 13.sp, textAlign = TextAlign.Center, lineHeight = 19.sp
                       )
                       Box(Modifier.height(18.dp))
@@ -2452,7 +2361,7 @@ jobs:
           keytool -genkeypair -v -keystore app/dummy.keystore -alias dummy \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass password -keypass password \
-            -dname "CN=GreyPulse, OU=Dev, O=Grey, L=NA, S=NA, C=US"
+            -dname "CN=GreyPulseX, OU=Dev, O=Grey, L=NA, S=NA, C=US"
 
       - name: Generate launcher icons
         run: |
@@ -2467,7 +2376,7 @@ jobs:
               S = sz * 4
               im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
               d = ImageDraw.Draw(im)
-              bg = (24, 24, 27, 255)
+              bg = (43, 43, 48, 255)
               if rnd:
                   d.ellipse((0, 0, S - 1, S - 1), fill=bg)
               else:
@@ -2503,11 +2412,11 @@ jobs:
       - name: Bundle output
         run: |
           mkdir -p bundle
-          cp app/build/outputs/apk/release/app-arm64-v8a-release.apk bundle/GreyPulse.apk
+          cp app/build/outputs/apk/release/app-arm64-v8a-release.apk bundle/GreyPulseX.apk
           cp -r app/src bundle/source
           cp .github/workflows/build.yml bundle/build.yml
           {
-            echo "App: GreyPulse (com.grey.pulse)"
+            echo "App: GreyPulseX (com.grey.pulsex)"
             echo "Build number: ${BUILD_NUMBER}"
             echo "Commit: ${GITHUB_SHA}"
             echo "Built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -2516,6 +2425,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GreyPulse-${{ github.run_number }}
+          name: GreyPulseX-${{ github.run_number }}
           path: bundle
           retention-days: 30
