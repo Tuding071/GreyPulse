@@ -269,6 +269,11 @@ jobs:
 
               @Volatile var analyzeOn = false
 
+              /** Offset > 0: the music itself is delayed by this many ms so the visuals lead it. */
+              @Volatile var audioDelayMs = 0
+              /** Set on seek/skip so the delay line forgets old audio. */
+              @Volatile var flushDelay = false
+
               @JvmField val levels = FloatArray(BANDS)
               @Volatile var mid = 0f
               @Volatile var lastUpdateNs = 0L
@@ -330,6 +335,13 @@ jobs:
               private var curFrame = 0
               private var framesTotal = 0L
 
+              // audio delay line (only used when Offset > 0), up to 5 s
+              private var dring = ShortArray(0)
+              private var dCap = 0
+              private var dWrite = 0
+              private var dFilled = 0
+              private var tmpS = ShortArray(2)
+
               // EQ state (audio thread only)
               private var eqVersionApplied = -1
               private var eqWasOn = false
@@ -383,6 +395,11 @@ jobs:
                   }
                   sr = inputAudioFormat.sampleRate
                   ch = inputAudioFormat.channelCount
+                  dCap = sr * 5 + 2
+                  dring = ShortArray(dCap * ch)
+                  dWrite = 0
+                  dFilled = 0
+                  tmpS = ShortArray(ch)
                   dec = 0
                   retune()
                   lp1 = 0.0; lp2 = 0.0
@@ -445,6 +462,16 @@ jobs:
                   chunkNs = System.nanoTime()
                   val on = AudioBus.eqOn && nBands > 0
                   val an = AudioBus.analyzeOn
+                  val dFrames = (AudioBus.audioDelayMs.toLong() * sr / 1000L).toInt().coerceIn(0, dCap - 2)
+                  if (AudioBus.flushDelay) {
+                      AudioBus.flushDelay = false
+                      dFilled = 0
+                      dWrite = 0
+                  }
+                  if (dFrames == 0) {
+                      dFilled = 0
+                      dWrite = 0
+                  }
                   if (on && !eqWasOn) java.util.Arrays.fill(st, 0.0)
                   eqWasOn = on
                   val frames = n / (2 * ch)
@@ -466,13 +493,49 @@ jobs:
                               }
                           }
                           val v = Math.round(x * 32768.0).coerceIn(-32768L, 32767L).toInt()
-                          out.putShort(v.toShort())
+                          tmpS[c] = v.toShort()
                           mono += x
+                      }
+                      if (dFrames == 0) {
+                          for (c in 0 until ch) out.putShort(tmpS[c])
+                      } else {
+                          val base = dWrite * ch
+                          for (c in 0 until ch) dring[base + c] = tmpS[c]
+                          if (dFilled < dCap) dFilled++
+                          if (dFrames < dFilled) {
+                              var rf = dWrite - dFrames
+                              if (rf < 0) rf += dCap
+                              val rb = rf * ch
+                              for (c in 0 until ch) out.putShort(dring[rb + c])
+                          } else {
+                              for (c in 0 until ch) out.putShort(0.toShort())
+                          }
+                          dWrite++
+                          if (dWrite == dCap) dWrite = 0
                       }
                       if (an) analyze(mono / ch)
                   }
                   while (inputBuffer.hasRemaining()) out.put(inputBuffer.get())
                   out.flip()
+              }
+
+              /** End of the song: play out what is still waiting in the delay line. */
+              override fun onQueueEndOfStream() {
+                  val dFrames = (AudioBus.audioDelayMs.toLong() * sr / 1000L).toInt().coerceIn(0, dCap - 2)
+                  if (dFrames == 0 || dFilled == 0) return
+                  val pending = if (dFrames < dFilled) dFrames else dFilled
+                  val out = replaceOutputBuffer(pending * ch * 2)
+                  var rf = dWrite - pending
+                  if (rf < 0) rf += dCap
+                  for (i in 0 until pending) {
+                      val rb = rf * ch
+                      for (c in 0 until ch) out.putShort(dring[rb + c])
+                      rf++
+                      if (rf == dCap) rf = 0
+                  }
+                  out.flip()
+                  dFilled = 0
+                  dWrite = 0
               }
 
               private fun syncEq() {
@@ -756,7 +819,8 @@ jobs:
           import kotlin.math.roundToInt
 
           val GreyBg = Color(0xFF2B2B30)
-          const val SYNC_MS = 120L   // beats are delivered this much later to match the speaker
+
+          const val HN = 720
 
           class VizItem(val id: String, val name: String)
 
@@ -857,11 +921,18 @@ jobs:
               val ready = remember { booleanArrayOf(false) }
               val uiCb by rememberUpdatedState(onUi)
               val main = remember { Handler(Looper.getMainLooper()) }
+              // short history of audio frames so the Offset can replay them later (up to 5 s at 144 Hz)
+              val hT = remember { LongArray(HN) }
+              val hL = remember { FloatArray(HN * AudioBus.BANDS) }
+              val hM = remember { FloatArray(HN) }
+              val hB = remember { FloatArray(HN) }
 
               // pushes audio data into the page every frame
               LaunchedEffect(ver) {
                   var lastHead = AudioBus.beatHead
                   var sentTitle = ""
+                  var hHead = 0
+                  var hCount = 0
                   while (true) {
                       withFrameMillis { }
                       val wv = holder[0] ?: continue
@@ -873,16 +944,41 @@ jobs:
                       val now = System.nanoTime()
                       val fresh = vm.isPlaying && (now - AudioBus.lastUpdateNs) < 250_000_000L
 
+                      // store this frame, then send the frame from (now - offset)
+                      val nb = AudioBus.BANDS
+                      val w = hHead
+                      hT[w] = now
+                      for (i in 0 until nb) hL[w * nb + i] = if (fresh) AudioBus.levels[i] else 0f
+                      hM[w] = if (fresh) AudioBus.mid else 0f
+                      hB[w] = if (fresh) AudioBus.bpm else 0f
+                      hHead = (hHead + 1) % HN
+                      if (hCount < HN) hCount++
+                      val tot = vm.totalMs
+                      val off = if (tot < 0) -tot else 0   // negative total = visuals later
+                      var r = w
+                      if (off > 0) {
+                          val target = now - off * 1_000_000L
+                          r = -1
+                          var k = w
+                          var cnt = 0
+                          while (cnt < hCount) {
+                              if (hT[k] <= target) { r = k; break }
+                              k = (k - 1 + HN) % HN
+                              cnt++
+                          }
+                      }
+
                       val sb = StringBuilder(220)
                       sb.append("window.GreyPulse&&GreyPulse._u([")
-                      for (i in 0 until AudioBus.BANDS) {
+                      for (i in 0 until nb) {
                           if (i > 0) sb.append(',')
-                          if (fresh) sb.append((AudioBus.levels[i] * 1000f).roundToInt() / 1000f) else sb.append('0')
+                          val lv = if (r >= 0) hL[r * nb + i] else 0f
+                          sb.append((lv * 1000f).roundToInt() / 1000f)
                       }
                       sb.append("],")
-                      if (fresh) sb.append((AudioBus.mid * 1000f).roundToInt() / 1000f) else sb.append('0')
+                      sb.append(((if (r >= 0) hM[r] else 0f) * 1000f).roundToInt() / 1000f)
                       sb.append(',')
-                      sb.append(if (fresh) AudioBus.bpm.roundToInt() else 0)
+                      sb.append(if (r >= 0) hB[r].roundToInt() else 0)
                       sb.append(',')
                       sb.append(if (vm.isPlaying) "true" else "false")
                       sb.append(',').append(vm.posMs).append(',').append(vm.durMs).append(')')
@@ -906,7 +1002,7 @@ jobs:
                               if (now - bns < 1_500_000_000L) {
                                   val js = "window.GreyPulse&&GreyPulse._b(" + AudioBus.beatStr[k] + "," +
                                       AudioBus.beatKind[k] + ")"
-                                  val wait = ((bns + SYNC_MS * 1_000_000L - now) / 1_000_000L).coerceAtLeast(0L)
+                                  val wait = ((bns + (if (vm.totalMs < 0) -vm.totalMs else 0) * 1_000_000L - now) / 1_000_000L).coerceAtLeast(0L)
                                   main.postDelayed({ wv.evaluateJavascript(js, null) }, wait)
                               }
                               i++
@@ -957,10 +1053,15 @@ jobs:
           const val GUIDE = """GREYPULSE VISUALIZER GUIDE
           (Give this whole text to any AI, then describe the visualizer you want.)
 
+          INSTRUCTION TO THE AI (read first)
+          After reading this guide, reply with ONLY the two words: Got it
+          Do NOT write any code yet. Wait until the user describes the visualizer they want, then build it following every rule below.
+
           WHAT THIS IS
-          GreyPulse is a music player app. A visualizer is ONE self-contained HTML file (HTML + CSS + JavaScript, all inline). The app shows it full screen behind the player and feeds it live audio data every frame. The visualizer can also control the player and can hide the app's own buttons so the page owns the whole screen.
+          GreyPulse is a music player app. A visualizer is ONE self-contained HTML file (HTML + CSS + JavaScript, all inline). The app shows it full screen behind the player and feeds it live audio data every frame. The app already has ALL the music player features, so the visualizer does ONLY visualization.
 
           RULES FOR THE FILE
+          (These rules are DEFAULTS, not hard limits. If the user explicitly asks for something that goes against one of them, for example "add a gesture for next song", a title, a button, or a different circle size, do what the user asks. Without such an instruction, follow the rules.)
           1. Reply with ONE complete HTML file only, in a single code block.
           2. Everything inline in that one file. No external files. No libraries unless the user asks (a CDN script only works with internet).
           3. NAME (required): inside <head> put this line with a short name (2 to 4 words):
@@ -971,6 +1072,19 @@ jobs:
           6. Must be smooth on a phone: use requestAnimationFrame and avoid heavy allocations per frame.
           7. Must not crash when GreyPulse is missing (testing in a normal browser):
              var G = window.GreyPulse || {levels:[],mid:0,bpm:0,playing:false,pos:0,dur:0,title:"",artist:""};
+          8. VISUALIZATION ONLY (by default). The app already has the song name and artist, seekbar, time, play/pause/next/prev buttons, and everything else a player needs. Do not draw or add any of these, do not add gestures for next, prev, pause, seek, volume, etc., and do not show the song title, unless the user explicitly asks. Only the visual itself.
+          9. SETTINGS WINDOW (add it whenever the visualizer has anything configurable: colors, sizes, speeds, sensitivity, counts, on/off options):
+             - Open it by touch and HOLD for 3 seconds on the visualizer (cancel the hold if the finger moves more than 10px or lifts early). No visible settings button.
+             - It is a pop-up window with toggles, sliders, color pickers, etc. (big touch targets, at least 44px). A Close button inside it, tapping outside it also closes it, holding 3 seconds again toggles it.
+             - SAFE AREA: the app's own buttons cover the top and bottom of the screen. The window must stay between them: its top edge at least 120px from the top of the page, its bottom edge at least 290px from the bottom of the page. Use  position:fixed; top:120px; left:4%; width:92%; max-height:calc(100vh - 410px); overflow-y:auto;  and size it smaller if it has few options. It must never go over the top bar or the bottom controls, on any screen size.
+             - Save the settings in localStorage (inside try/catch) and restore them on load.
+             - The visualizer keeps running behind the window.
+          10. CIRCLE VISUALIZERS: if the visual is a circle (just the circle), use a CONSTANT size defined at the top of the script and used everywhere:
+             var CIRCLE_RADIUS = 110;   // CSS px. Default: 110 (220px wide). Audio reactions add or subtract a small amount around it (at most about +40px), they never change the base size.
+             (Fixed circle size is the default. If the user asks for a different size or a size that changes, do that.)
+             Center it in the safe area: cx = innerWidth/2, cy = (120 + (innerHeight - 290)) / 2. Keep the biggest possible size (CIRCLE_RADIUS plus reaction) inside the safe area. If the user asks for another size, only change this constant. If there is a settings window, give it a Size slider that changes CIRCLE_RADIUS (range 60 to 160).
+
+          11. NO DELAY / OFFSET / SYNC CODE. The app has its own Offset setting (menu > Offset, two sliders, each -5000 to +5000 ms, 0 = off, negative = visuals later, positive = visuals earlier) that shifts the timing of ALL the data below (levels, mid, bpm and beats) against the sound. The visualizer must NOT handle this: no delay, latency, offset or sync slider, no setTimeout delays, no buffering or replaying of levels. React instantly to the data as it arrives.
 
           AUDIO DATA (global object GreyPulse, updated every frame, just read it inside your requestAnimationFrame loop)
           GreyPulse.levels  array of 12 numbers 0..1 = bass spectrum. Index 0 = 16 Hz ... index 11 = 60 Hz.
@@ -985,7 +1099,7 @@ jobs:
           GreyPulse.onBeat = function(strength, kind){}   strength 0.3 to 1. kind: 0 = beat, 1 = start of a bar, 2 = every 8th bar. Good for pops, flashes, particle kicks.
           GreyPulse.onTrack = function(title, artist){}   called when the song changes.
 
-          CONTROLS (call these from your own buttons or touch gestures)
+          CONTROLS (they exist, but DO NOT use them unless the user explicitly asks for one: the app already has every player control)
           GreyPulse.toggle()  play or pause      GreyPulse.play()    GreyPulse.pause()
           GreyPulse.next()    GreyPulse.prev()
           GreyPulse.seek(f)   f = 0..1 position in the song
@@ -993,8 +1107,9 @@ jobs:
           GreyPulse.showUi()  shows them again.
 
           TIPS
-          - A visualizer can be made of the canvas plus its own control panel (sliders, toggles, color pickers) drawn in HTML. Store settings in localStorage if the user wants them remembered.
-          - When the app UI is visible the page only gets touches in the empty middle area, so keep important touch areas there, or call hideUi().
+          - Configurable things go in the hold-3-seconds settings window (rule 9), never in always-visible buttons.
+          - While the app buttons are visible the page only receives touches in the empty middle area between the top bar and bottom controls, which is exactly the safe area from rule 9.
+          - Do not call hideUi() unless the user asks.
           - Keep colors high contrast on a dark background unless asked otherwise.
 
           MINIMAL COMPLETE EXAMPLE
@@ -1174,7 +1289,7 @@ jobs:
           // ---------------------------------------------------------------- data
           data class Track(val id: Long, val title: String, val artist: String, val durMs: Long, val uri: Uri)
 
-          enum class Panel { None, List, Menu, Eq, VizList, VizAdd, Guide }
+          enum class Panel { None, List, Menu, Eq, VizList, VizAdd, Guide, Offset }
 
           fun scanTracks(ctx: Context): List<Track> {
               val list = ArrayList<Track>()
@@ -1226,6 +1341,9 @@ jobs:
               var vizSel by mutableStateOf("")
               var vizHtml by mutableStateOf<String?>(null)
               var vizVersion by mutableStateOf(0)
+              var syncMs by mutableStateOf(0)     // slider 1: wired / base sync, -5000 (visuals later) .. +5000 (earlier)
+              var btMs by mutableStateOf(0)       // slider 2: Bluetooth / wireless extra, same range
+              val totalMs: Int get() = (syncMs + btMs).coerceIn(-5000, 5000)
               var controller: MediaController? = null
 
               private val prefs = app.getSharedPreferences("pulsex", Context.MODE_PRIVATE)
@@ -1234,11 +1352,41 @@ jobs:
                   override fun onEvents(player: Player, events: Player.Events) {
                       sync()
                   }
+
+                  override fun onPositionDiscontinuity(
+                      oldPosition: Player.PositionInfo,
+                      newPosition: Player.PositionInfo,
+                      reason: Int
+                  ) {
+                      // seek / skip: drop the audio delay tail (a normal song change keeps it)
+                      if (reason != Player.DISCONTINUITY_REASON_AUTO_TRANSITION) AudioBus.flushDelay = true
+                  }
               }
 
               init {
+                  syncMs = prefs.getInt("offset_ms", 0).coerceIn(-5000, 5000)
+                  btMs = prefs.getInt("offset_bt_ms", 0).coerceIn(-5000, 5000)
+                  applyOffset()
                   loadEq()
                   loadViz()
+              }
+
+              /** total < 0: the visuals wait. total > 0: the music is delayed so the visuals lead. */
+              private fun applyOffset() {
+                  val t = totalMs
+                  AudioBus.audioDelayMs = if (t > 0) t else 0
+              }
+
+              fun setSync(v: Int) {
+                  syncMs = v.coerceIn(-5000, 5000)
+                  applyOffset()
+                  prefs.edit().putInt("offset_ms", syncMs).apply()
+              }
+
+              fun setBt(v: Int) {
+                  btMs = v.coerceIn(-5000, 5000)
+                  applyOffset()
+                  prefs.edit().putInt("offset_bt_ms", btMs).apply()
               }
 
               // ---- visualizers
@@ -1489,6 +1637,12 @@ jobs:
           }
 
           @Composable
+          fun IconOffset() = Ico(20.dp) {
+              drawCircle(Color.White, 9f, Offset(12f, 12f), style = androidx.compose.ui.graphics.drawscope.Stroke(2f))
+              ln(Color.White, 12f, 12f, 12f, 6.5f, 2f); ln(Color.White, 12f, 12f, 16f, 14f, 2f)
+          }
+
+          @Composable
           fun IconAddViz() = Ico(20.dp) {
               ln(Color.White, 12f, 4f, 12f, 20f, 2.2f); ln(Color.White, 4f, 12f, 20f, 12f, 2.2f)
           }
@@ -1608,7 +1762,7 @@ jobs:
               fun back() {
                   panel = when (panel) {
                       Panel.Guide -> Panel.VizAdd
-                      Panel.VizAdd, Panel.VizList, Panel.Eq -> Panel.Menu
+                      Panel.VizAdd, Panel.VizList, Panel.Eq, Panel.Offset -> Panel.Menu
                       else -> Panel.None
                   }
               }
@@ -1661,6 +1815,7 @@ jobs:
                                       onEq = { panel = Panel.Eq },
                                       onVizAdd = { panel = Panel.VizAdd },
                                       onVizList = { panel = Panel.VizList },
+                                      onOffset = { panel = Panel.Offset },
                                       onScan = { panel = Panel.None; requestAndScan(true) }
                                   )
                               }
@@ -1672,6 +1827,9 @@ jobs:
                               }
                               Overlay(panel == Panel.Guide) {
                                   GuidePanel()
+                              }
+                              Overlay(panel == Panel.Offset) {
+                                  OffsetPanel(vm)
                               }
                               Overlay(panel == Panel.Eq) {
                                   EqPanel(vm) { idx -> pendingDelete = idx }
@@ -1804,11 +1962,12 @@ jobs:
 
           // ---------------------------------------------------------------- menu
           @Composable
-          fun MenuPanel(onEq: () -> Unit, onVizAdd: () -> Unit, onVizList: () -> Unit, onScan: () -> Unit) {
+          fun MenuPanel(onEq: () -> Unit, onVizAdd: () -> Unit, onVizList: () -> Unit, onOffset: () -> Unit, onScan: () -> Unit) {
               Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                   MenuRow("Equalizer", "Add bands and shape the sound", onEq) { IconEq() }
                   MenuRow("Add Visualizer", "Paste or import an HTML visualizer", onVizAdd) { IconAddViz() }
                   MenuRow("Visualizers", "Pick which one is on screen", onVizList) { IconViz() }
+                  MenuRow("Offset", "Two sliders: sync and Bluetooth", onOffset) { IconOffset() }
                   MenuRow("Scan Files", "Find songs on this device", onScan) { IconScan() }
               }
           }
@@ -1827,6 +1986,90 @@ jobs:
                       Text(title, color = CText, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                       Text(sub, color = CDim, fontSize = 11.sp)
                   }
+              }
+          }
+
+          // ---------------------------------------------------------------- offset
+          /** Slider position -> offset ms (-5000..+5000), snaps to 0 near the center. */
+          fun offFrom(x: Float, w: Float): Int {
+              val v = ((x / w).coerceIn(0f, 1f) * 10000f - 5000f).roundToInt()
+              return if (v > -50 && v < 50) 0 else v
+          }
+
+          @Composable
+          fun OffsetSlider(title: String, v: Int, onSet: (Int) -> Unit) {
+              var wPx by remember { mutableStateOf(1f) }
+              val f = ((v + 5000) / 10000f).coerceIn(0f, 1f)
+              Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                      Text(title, color = Color(0xCCFFFFFF), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                      Text(
+                          if (v == 0) "0 ms (off)" else if (v < 0) v.toString() + " ms" else "+" + v + " ms",
+                          color = CDim, fontSize = 12.sp
+                      )
+                  }
+                  Box(
+                      Modifier
+                          .fillMaxWidth()
+                          .height(40.dp)
+                          .onSizeChanged { wPx = it.width.toFloat().coerceAtLeast(1f) }
+                          .pointerInput(Unit) {
+                              detectTapGestures { o -> onSet(offFrom(o.x, wPx)) }
+                          }
+                          .pointerInput(Unit) {
+                              detectHorizontalDragGestures(
+                                  onDragStart = { o -> onSet(offFrom(o.x, wPx)) },
+                                  onHorizontalDrag = { ch, _ -> onSet(offFrom(ch.position.x, wPx)) }
+                              )
+                          },
+                      contentAlignment = Alignment.CenterStart
+                  ) {
+                      Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(99.dp)).background(CSurf3))
+                      Box(Modifier.align(Alignment.Center).width(2.dp).height(14.dp).background(CDim))
+                      Box(
+                          Modifier
+                              .offset { IntOffset((f * wPx - 7.dp.toPx()).roundToInt(), 0) }
+                              .size(14.dp).clip(CircleShape).background(Color.White)
+                      )
+                  }
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                      Text("-5000 visuals later", color = CDim, fontSize = 10.sp)
+                      Text("0", color = CDim, fontSize = 10.sp)
+                      Text("+5000 visuals earlier", color = CDim, fontSize = 10.sp)
+                  }
+                  Box(Modifier.height(8.dp))
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      PillBtn("-10", Modifier.weight(1f)) { onSet(v - 10) }
+                      PillBtn("+10", Modifier.weight(1f)) { onSet(v + 10) }
+                      PillBtn("Center (0)", Modifier.weight(1f)) { onSet(0) }
+                  }
+              }
+          }
+
+          @Composable
+          fun OffsetPanel(vm: PlayerVm) {
+              val total = vm.totalMs
+              Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                  Column(Modifier.fillMaxWidth().padding(start = 4.dp, top = 6.dp, bottom = 14.dp)) {
+                      Text("Offset", color = CText, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                      Text("LEFT = VISUALS LATER, RIGHT = VISUALS EARLIER", color = CDim, fontSize = 10.sp, letterSpacing = 0.6.sp)
+                  }
+                  OffsetSlider("1. Sync (wired / phone speaker)", vm.syncMs) { vm.setSync(it) }
+                  Box(Modifier.height(20.dp))
+                  OffsetSlider("2. Bluetooth / wireless extra", vm.btMs) { vm.setBt(it) }
+                  Box(Modifier.height(18.dp))
+                  Text(
+                      "Total: " + (if (total > 0) "+" else "") + total + " ms  (slider 1 + slider 2)",
+                      color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+                      modifier = Modifier.padding(horizontal = 10.dp)
+                  )
+                  Box(Modifier.height(6.dp))
+                  Text(
+                      "Set slider 1 once with wired earphones. Slider 2 stays 0 for wired; with Bluetooth only touch slider 2. Total below 0: the visuals wait. Total above 0: the app delays the music itself so the visuals lead (a seek or pause then reacts that much later).",
+                      color = CDim, fontSize = 11.sp, lineHeight = 16.sp,
+                      modifier = Modifier.padding(horizontal = 10.dp)
+                  )
+                  Box(Modifier.height(20.dp))
               }
           }
 
